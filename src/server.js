@@ -3,6 +3,7 @@
 const http = require('http');
 const { Server } = require('socket.io');
 const { createAdapter } = require('@socket.io/redis-adapter');
+const { createClient } = require('redis');
 
 const config = require('./config');
 const logger = require('./shared/logger');
@@ -45,17 +46,33 @@ async function main() {
     },
   });
 
-  // Multi-dyno ready: Redis adapter (pub/sub — near-zero Redis RAM). Redis
-  // down ho to adapter silently degrade hota hai (local single-dyno behavior),
-  // ioredis reconnect ke baad khud wapas attach hota hai. Fail-open by design.
+  // Multi-dyno ready: Redis adapter (pub/sub — near-zero Redis RAM).
+  // Adapter ke clients `redis` (node-redis v4) se banaye jaate hain — ye
+  // @socket.io/redis-adapter ka primary supported client hai (commands queue
+  // hote hain, callbacks ke saath — crash nahi hota). ioredis iske liye use
+  // NA karo: v5/v6 dono ke saath boot-crash paths reproduce hue hain.
+  // Fail-open: adapter init fail ho to app single-dyno mode mein chalta hai.
   const redisClient = getRedis();
   if (redisClient) {
-    const pub = redisClient.duplicate();
-    const sub = redisClient.duplicate();
-    pub.on('error', (err) => logger.warn({ err: { message: err.message } }, 'redis adapter pub error'));
-    sub.on('error', (err) => logger.warn({ err: { message: err.message } }, 'redis adapter sub error'));
-    io.adapter(createAdapter(pub, sub));
-    logger.info('Socket.IO Redis adapter enabled (multi-dyno)');
+    try {
+      const adapterRedisOptions = { url: config.redisUrl };
+      if (config.redisUrl.startsWith('rediss://')) {
+        adapterRedisOptions.socket = {
+          tls: true,
+          rejectUnauthorized: config.redisTlsRejectUnauthorized !== false,
+        };
+      }
+      const pub = createClient(adapterRedisOptions);
+      const sub = createClient(adapterRedisOptions);
+      pub.on('error', (err) => logger.warn({ err: { message: err.message } }, 'redis adapter pub error'));
+      sub.on('error', (err) => logger.warn({ err: { message: err.message } }, 'redis adapter sub error'));
+      pub.connect().catch(() => {});
+      sub.connect().catch(() => {});
+      io.adapter(createAdapter(pub, sub));
+      logger.info('Socket.IO Redis adapter enabled (multi-dyno)');
+    } catch (err) {
+      logger.error({ err: { message: err.message } }, 'Socket.IO Redis adapter init failed — single-dyno fallback (fail-open)');
+    }
   }
   app.set('socketio', io);
   initSockets(io);
