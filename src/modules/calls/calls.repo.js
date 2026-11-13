@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 // Calls repo — call_sessions table access (Stage 5).
 // Signaling call IDs par hoti hai; status transitions yahan atomic hain
 // (WHERE status = expected → koi race nahi).
@@ -72,7 +74,7 @@ function createCallsRepo({ db }) {
 
     async findMembership(conversationId, userId) {
       const res = await q(
-        `SELECT cm.user_id, cm.role, cm.left_at, c.kind
+        `SELECT cm.user_id, cm.role, cm.left_at, c.kind, c.name
          FROM conversation_members cm
          JOIN conversations c ON c.id = cm.conversation_id
          WHERE cm.conversation_id = $1 AND cm.user_id = $2
@@ -92,13 +94,106 @@ function createCallsRepo({ db }) {
       return res.rows[0] ? res.rows[0].user_id : null;
     },
 
-    async insertCall({ id, conversationId, initiatorUserId, callType, status, offerSdp }) {
+    // ===== Group call participants (mesh) =====
+
+    // Idempotent join: pehli baar insert, dobara join par left_at reset.
+    async addParticipant(callId, userId) {
+      await q(
+        `INSERT INTO call_participants (id, call_id, user_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (call_id, user_id)
+         DO UPDATE SET left_at = NULL, joined_at = now()`,
+        [crypto.randomUUID(), callId, userId]
+      );
+    },
+
+    async removeParticipant(callId, userId) {
+      await q(
+        `UPDATE call_participants SET left_at = now()
+         WHERE call_id = $1 AND user_id = $2 AND left_at IS NULL`,
+        [callId, userId]
+      );
+    },
+
+    // Active participants (left_at NULL) — joiner ko existing peers dene ke
+    // liye + peer-left broadcast ke liye.
+    async listActiveParticipants(callId) {
+      const res = await q(
+        `SELECT cp.user_id, cp.joined_at, u.display_name, u.username
+         FROM call_participants cp
+         JOIN users u ON u.id = cp.user_id
+         WHERE cp.call_id = $1 AND cp.left_at IS NULL
+         ORDER BY cp.joined_at ASC`,
+        [callId]
+      );
+      return res.rows;
+    },
+
+    async isParticipant(callId, userId) {
+      const res = await q(
+        `SELECT 1 FROM call_participants
+         WHERE call_id = $1 AND user_id = $2 AND left_at IS NULL
+         LIMIT 1`,
+        [callId, userId]
+      );
+      return Boolean(res.rows[0]);
+    },
+
+    // Ring-all: conversation ke active members (group calls ke liye).
+    async listOtherActiveMemberIds(conversationId, excludeUserId) {
+      const res = await q(
+        `SELECT user_id FROM conversation_members
+         WHERE conversation_id = $1 AND user_id <> $2 AND left_at IS NULL`,
+        [conversationId, excludeUserId]
+      );
+      return res.rows.map((r) => r.user_id);
+    },
+
+    // User ke active group-call participations — autoEnd ke liye.
+    async listActiveParticipationsForUser(userId) {
+      const res = await q(
+        `SELECT cp.call_id
+         FROM call_participants cp
+         JOIN call_sessions cs ON cs.id = cp.call_id
+         WHERE cp.user_id = $1 AND cp.left_at IS NULL
+           AND cs.status IN ('ringing', 'ongoing')`,
+        [userId]
+      );
+      return res.rows.map((r) => r.call_id);
+    },
+
+    // Group mein pehle se chal rahi call (kam az kam ek active participant ke
+    // saath) — doosra member call dabaye to nayi call nahi, isi mein join.
+    async findOngoingGroupCall(conversationId) {
+      const res = await q(
+        `SELECT cs.id, cs.started_at
+         FROM call_sessions cs
+         JOIN call_participants cp ON cp.call_id = cs.id AND cp.left_at IS NULL
+         WHERE cs.conversation_id = $1 AND cs.status = 'ongoing'
+         ORDER BY cs.started_at DESC
+         LIMIT 1`,
+        [conversationId]
+      );
+      return res.rows[0] ? res.rows[0].id : null;
+    },
+
+    // Caller/joiner ka naam (push + peer-joined) — controller/socket `me`
+    // mein sirf id hoti hai.
+    async findUserProfile(userId) {
+      const res = await q(
+        `SELECT display_name, username FROM users WHERE id = $1 LIMIT 1`,
+        [userId]
+      );
+      return res.rows[0] || null;
+    },
+
+    async insertCall({ id, conversationId, initiatorUserId, callType, status, offerSdp, startedAt }) {
       const res = await q(
         `INSERT INTO call_sessions
-           (id, conversation_id, initiator_user_id, call_type, status, offer_sdp)
-         VALUES ($1, $2, $3, $4, $5, $6)
+           (id, conversation_id, initiator_user_id, call_type, status, offer_sdp, started_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING ${CALL_RETURN_COLUMNS}`,
-        [id, conversationId, initiatorUserId, callType, status, offerSdp || null]
+        [id, conversationId, initiatorUserId, callType, status, offerSdp || null, startedAt || null]
       );
       return res.rows[0] || null;
     },
@@ -156,19 +251,33 @@ function createCallsRepo({ db }) {
       );
     },
 
-    // Busy detection: user kisi active (ringing/ongoing) call ka member hai ya nahi.
+    // Busy detection: user kisi active (ringing/ongoing) call ka member hai ya
+    // nahi — 1:1 membership (sirf one_to_one; warna group call sab members ko
+    // falsely busy dikhati) ya group participation (call_participants) dono.
     async findActiveCallForUser(userId, since) {
       const res = await q(
         `SELECT cs.id FROM call_sessions cs
+         JOIN conversations c ON c.id = cs.conversation_id
          JOIN conversation_members cm
            ON cm.conversation_id = cs.conversation_id AND cm.left_at IS NULL
          WHERE cm.user_id = $1
+           AND c.kind = 'one_to_one'
            AND cs.status IN ('ringing', 'ongoing')
            AND cs.created_at > $2
          LIMIT 1`,
         [userId, since]
       );
-      return res.rows[0] ? res.rows[0].id : null;
+      if (res.rows[0]) return res.rows[0].id;
+      const part = await q(
+        `SELECT cp.call_id FROM call_participants cp
+         JOIN call_sessions cs ON cs.id = cp.call_id
+         WHERE cp.user_id = $1 AND cp.left_at IS NULL
+           AND cs.status IN ('ringing', 'ongoing')
+           AND cs.created_at > $2
+         LIMIT 1`,
+        [userId, since]
+      );
+      return part.rows[0] ? part.rows[0].call_id : null;
     },
 
     async listCalls(conversationId, cursor, limit) {

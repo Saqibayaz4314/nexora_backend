@@ -76,7 +76,7 @@ function fakeReceiptRedis() {
   };
 }
 
-async function fixture(t, { withRedis = true } = {}) {
+async function fixture(t, { withRedis = true, getIo = null } = {}) {
   const pool = await createTestPool();
   t.after(async () => { if (pool.end) await pool.end(); });
   const sender = { id: crypto.randomUUID(), sessionDeviceId: null, display_name: 'Sender', username: 'sender' };
@@ -100,6 +100,7 @@ async function fixture(t, { withRedis = true } = {}) {
     repo,
     contactsRepo: { async isBlocked() { return false; } },
     redis,
+    getIo,
   });
   const send = async (user = sender) => {
     const { message } = await service.sendMessage(user, conversationId, {
@@ -199,4 +200,129 @@ test('receipts fail-open: Redis ke baghair direct DB write (ticks nahi rukte)', 
   await service.updateReceipt(recipient, message.id, 'delivered');
   const row = await receiptRow(message.id, recipient.id);
   assert.ok(row && row.delivered_at, 'Redis na ho to receipt turant DB mein jana chahiye');
+});
+
+test('receipts: seen flush par reader ko receipts:updated event milta hai (unread badge clear)', async (t) => {
+  const emitted = [];
+  const getIo = () => ({
+    to(room) {
+      return { emit(event, payload) { emitted.push({ room, event, payload }); } };
+    },
+  });
+  const { service, recipient, conversationId, send } = await fixture(t, { getIo });
+  const message = await send();
+
+  await service.updateReceipt(recipient, message.id, 'seen');
+  emitted.length = 0; // updateReceipt ke message:seen emit ko ignore karo
+  await service.flushReceiptWatermarks();
+
+  const events = emitted.filter((e) => e.event === 'receipts:updated');
+  assert.equal(events.length, 1, 'seen flush ke baad receipts:updated emit hona chahiye');
+  assert.equal(events[0].room, `user:${recipient.id}`, 'reader ke user room par emit ho');
+  assert.deepEqual(events[0].payload.conversationIds, [conversationId]);
+});
+
+test('receipts: delivered flush receipts:updated emit nahi karta (badge unchanged)', async (t) => {
+  const emitted = [];
+  const getIo = () => ({
+    to(room) {
+      return { emit(event, payload) { emitted.push({ room, event, payload }); } };
+    },
+  });
+  const { service, recipient, send } = await fixture(t, { getIo });
+  const message = await send();
+
+  await service.updateReceipt(recipient, message.id, 'delivered');
+  await service.flushReceiptWatermarks();
+
+  assert.equal(emitted.filter((e) => e.event === 'receipts:updated').length, 0,
+    'delivered flush unread badge change nahi karta — event nahi hona chahiye');
+});
+
+test('listMessages: viewer ke apne messages ka status receipts se (sent/delivered/seen)', async (t) => {
+  const { repo, service, sender, recipient, conversationId, send } = await fixture(t);
+  const m1 = await send(); // sender ka — seen (watermark purane messages ko bhi cover karta hai)
+  await new Promise((r) => setTimeout(r, 20));
+  const m2 = await send(); // sender ka — delivered
+  await new Promise((r) => setTimeout(r, 20));
+  const m3 = await send(); // sender ka — koi receipt nahi
+  const m4 = await send(recipient); // recipient ka — sender ne nahi dekha
+
+  await service.updateReceipt(recipient, m1.id, 'seen');
+  await service.updateReceipt(recipient, m2.id, 'delivered');
+  await service.flushReceiptWatermarks();
+
+  // Sender ka view: apne messages par status, doosron ke messages par nahi.
+  const rows = await repo.listMessages(conversationId, null, 10, null, sender.id);
+  const status = new Map(rows.map((r) => [r.id, r.status]));
+  assert.equal(status.get(m1.id), 'seen');
+  assert.equal(status.get(m2.id), 'delivered');
+  assert.equal(status.get(m3.id), 'sent');
+  assert.equal(status.get(m4.id), undefined, 'doosron ke messages par status nahi');
+
+  // Recipient ka view: apna message status ke saath.
+  const recipientRows = await repo.listMessages(conversationId, null, 10, null, recipient.id);
+  const recipientStatus = new Map(recipientRows.map((r) => [r.id, r.status]));
+  assert.equal(recipientStatus.get(m4.id), 'sent', 'recipient ka apna message sent (sender ne nahi dekha)');
+  assert.equal(recipientStatus.get(m1.id), undefined, 'recipient ke liye sender ke messages par status nahi');
+});
+
+test('read paths pending watermarks pehle flush karte hain: listMessages status stale nahi (blue tick regression fix)', async (t) => {
+  const { service, sender, recipient, conversationId, send } = await fixture(t);
+  const m1 = await send();
+  // Recipient ne seen kiya — watermark Redis mein pending (flusher abhi
+  // nahi chala), DB mein receipt nahi. Bina pre-flush ke reload par status
+  // 'sent' parh leta (blue tick wapas gray ho jata tha).
+  await service.updateReceipt(recipient, m1.id, 'seen');
+
+  // Sender ka reload — service path (pre-flush included).
+  const data = await service.listMessages(sender, conversationId, null, 10);
+  const mine = data.messages.find((m) => m.id === m1.id);
+  assert.equal(mine.status, 'seen', 'pending flush ke bawajood status seen');
+});
+
+test('read paths pending watermarks pehle flush karte hain: listMyConversations unread stale nahi (badge regression fix)', async (t) => {
+  const { service, sender, recipient, conversationId, send } = await fixture(t);
+  await send();
+  await send();
+  // Recipient ne chat khol kar sab seen kiya — watermark pending, DB flush
+  // abhi nahi hua. List reload par unread 0 hona chahiye (stale badge fix).
+  const convs = await service.listMyConversations(recipient, 20);
+  const before = convs.conversations.find((c) => c.id === conversationId);
+  // Pehle receipts bhejo (watermark advance) — pre-flush hi DB likhega.
+  const data = await service.listMessages(recipient, conversationId, null, 10);
+  for (const m of data.messages) {
+    if (m.senderUserId !== recipient.id) {
+      // eslint-disable-next-line no-await-in-loop
+      await service.updateReceipt(recipient, m.id, 'seen');
+    }
+  }
+  const after = await service.listMyConversations(recipient, 20);
+  const conv = after.conversations.find((c) => c.id === conversationId);
+  assert.equal(conv.unreadCount, 0, 'seen ke baad badge wapas nahi aana chahiye');
+  assert.ok(before, 'conversation list mein conversation maujood');
+});
+
+test("listMessages: peer chat delete kare to bhi ticks preserve (sent-regression fallback)", async (t) => {
+  const { pool, repo, service, sender, recipient, conversationId, send } = await fixture(t);
+
+  const m1 = await send(); // seen hoga
+  const m2 = await send(); // sirf delivered hoga
+  const m3 = await send(); // receipt hi nahi
+  await service.updateReceipt(recipient, m1.id, 'seen');
+  await service.updateReceipt(recipient, m2.id, 'delivered');
+  await service.flushReceiptWatermarks();
+
+  // Ab recipient chat delete karta hai (left_at set) — uske baad member-based
+  // query se status nahi milta (koi active doosra member nahi). Fallback
+  // receipts se compute hona chahiye, warna sab ticks 'sent' dikhte the.
+  await pool.query(
+    'UPDATE conversation_members SET left_at = now() WHERE conversation_id = $1 AND user_id = $2',
+    [conversationId, recipient.id]
+  );
+  const rows = await repo.listMessages(conversationId, null, 10, null, sender.id);
+  const status = new Map(rows.map((r) => [r.id, r.status]));
+  assert.equal(status.get(m1.id), 'seen', 'chat delete ke baad bhi seen tick');
+  assert.equal(status.get(m2.id), 'delivered', 'chat delete ke baad delivered tick');
+  assert.equal(status.get(m3.id), 'sent', 'receipt ke baghair sent hi');
 });

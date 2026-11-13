@@ -72,6 +72,14 @@ function createFcmDispatcher({ logger, env = process.env } = {}) {
     }
   }
 
+  // Boot-time readiness log: production mein credentials missing hon to
+  // Heroku logs mein turant nazar aaye (push silent-fail na ho).
+  if (fcmReady) {
+    if (log.info) log.info('FCM push ready (firebase-admin)');
+  } else if (env.NODE_ENV === 'production') {
+    if (log.warn) log.warn('FCM credentials configured nahi hain (FIREBASE_SERVICE_ACCOUNT / GOOGLE_APPLICATION_CREDENTIALS) — pushes log transport par hain, devices ko notification NAHI milegi');
+  }
+
   async function sendToDevice(pushToken, { title, body, data, dataOnly = false }) {
     if (!pushToken) {
       return { sent: false, reason: 'no_token' };

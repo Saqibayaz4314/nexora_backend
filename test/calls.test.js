@@ -571,3 +571,36 @@ test('calls: cleanup retention', async (t) => {
     });
   });
 });
+
+test('calls: autoEndOngoingCalls offline par ongoing end karta hai', async (t) => {
+  await t.test('ongoing call end + busy keys clear + naya call foran possible', async (t) => {
+    const { repo, redis, service, caller, callee, initiate } = await callServiceFixture(t);
+    const { call } = await initiate();
+    await service.answerCall(callee, call.id, 'answer-sdp');
+    assert.equal((await repo.findCallById(call.id)).status, 'ongoing');
+    assert.equal(await redis.get(`call:active:${caller.id}`), call.id);
+    assert.equal(await redis.get(`call:active:${callee.id}`), call.id);
+
+    // Callee ka app kill — grace khatam, socket layer auto-end bulata hai.
+    const result = await service.autoEndOngoingCalls(callee.id);
+    assert.equal(result.ended, 1);
+    const row = await repo.findCallById(call.id);
+    assert.equal(row.status, 'ended');
+    assert.ok(row.ended_at);
+    assert.equal(await redis.exists(`call:active:${caller.id}`), 0);
+    assert.equal(await redis.exists(`call:active:${callee.id}`), 0);
+
+    // Busy block heal — naya call turant ho sakta hai (409 nahi).
+    const next = await initiate();
+    assert.equal(next.call.status, 'ringing');
+  });
+
+  await t.test('no active call ho to no-op; fresh ringing untouched', async (t) => {
+    const { repo, service, caller, callee, initiate } = await callServiceFixture(t);
+    assert.deepEqual(await service.autoEndOngoingCalls(callee.id), { ended: 0 });
+    const { call } = await initiate();
+    await service.autoEndOngoingCalls(callee.id); // ringing ko chhedta nahi
+    assert.equal((await repo.findCallById(call.id)).status, 'ringing');
+    assert.ok(caller.id);
+  });
+});

@@ -133,6 +133,9 @@ const config = {
   callRingTimeoutSeconds: parseInt(env.CALL_RING_TIMEOUT_SECONDS || '60', 10), // ringing kitni der tak
   callActiveTtlSeconds: parseInt(env.CALL_ACTIVE_TTL_SECONDS || String(2 * 60 * 60), 10), // active call max (busy detection)
   callMaxDurationSeconds: parseInt(env.CALL_MAX_DURATION_SECONDS || String(24 * 60 * 60), 10), // ongoing cleanup threshold
+  // Outgoing call rate limit (per minute, per user). Testing mein 5 bahut
+  // tight tha (bar bar 429) — default 10, env se overridable.
+  callRateLimitPerMinute: parseInt(env.CALL_RATE_LIMIT_PER_MINUTE || '10', 10),
   // Slow-network grace: disconnect ke baad itne seconds tak offline mark nahi
   // hota (false offline flash se bachne ke liye). 0 = turant offline (purana behavior).
   presenceGraceSeconds: parseInt(env.PRESENCE_GRACE_SECONDS || '15', 10),

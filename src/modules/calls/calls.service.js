@@ -32,6 +32,8 @@ function createCallsService({
   const ringTimeoutSeconds = (config && config.callRingTimeoutSeconds) || 60;
   const activeTtlSeconds = (config && config.callActiveTtlSeconds) || 2 * 60 * 60;
   const callRateLimitPerMinute = (config && config.callRateLimitPerMinute) || 5;
+  // Mesh WebRTC limit — mobile CPU/bandwidth par 8 realistic max hai.
+  const maxGroupParticipants = (config && config.maxGroupCallParticipants) || 8;
 
   function ensureDb() {
     if (!db) {
@@ -83,6 +85,49 @@ function createCallsService({
     await clearBusyKey(call.initiator_user_id, call.id);
   }
 
+  // User fully offline ho gaya (disconnect grace khatam, koi socket nahi) —
+  // uski ongoing calls end karo. App call ke dauraan kill ho jaye (bina
+  // call:end socket event ke) to busy key/row agle 2h tak naye calls ko
+  // 409 USER_IN_CALL se block karti hai; yeh usay turant heal karta hai.
+  // Peer ko call:ended milta hai (WhatsApp style — network drop = call drop).
+  async function autoEndOngoingCalls(userId) {
+    ensureDb();
+    let ended = 0;
+    // Group calls: sirf is user ki participation hato (poori call nahi) —
+    // baaki participants ko peer-left; aakhri nikla to call end.
+    const groupCallIds = await repo.listActiveParticipationsForUser(userId);
+    for (const callId of groupCallIds) {
+      await repo.removeParticipant(callId, userId);
+      await clearBusyKey(userId, callId);
+      const remaining = await repo.listActiveParticipants(callId);
+      for (const p of remaining) {
+        emitToUser(p.user_id, 'call:group:peer-left', { callId, userId });
+      }
+      if (remaining.length === 0) {
+        const row = await repo.transitionStatus(callId, ['ongoing'], 'ended', { endedAt: new Date() });
+        if (row) ended++;
+      }
+    }
+    // 1:1 calls: poori call end (existing behavior).
+    for (;;) {
+      const activeCallId = await findActiveCallForUser(userId);
+      if (!activeCallId) break;
+      const call = await repo.findCallById(activeCallId);
+      // Fresh ringing ko yahan mat chhedo — ring timeout/cleanup sambhalta hai.
+      if (!call || call.status !== 'ongoing') break;
+      const row = await repo.transitionStatus(activeCallId, ['ongoing'], 'ended', { endedAt: new Date() });
+      if (!row) break;
+      ended++;
+      const otherId = await repo.getOtherMemberId(call.conversation_id, userId);
+      if (otherId) {
+        await clearBusyKey(otherId, activeCallId);
+        emitToUser(otherId, 'call:ended', { callId: activeCallId });
+      }
+      await clearBusyKey(userId, activeCallId);
+    }
+    return { ended };
+  }
+
   async function requireMembership(conversationId, userId) {
     const membership = await repo.findMembership(conversationId, userId);
     if (!membership || membership.left_at) {
@@ -100,14 +145,59 @@ function createCallsService({
   }
 
   async function isParticipant(call, userId) {
+    // Group calls: participation call_participants se (initiator bhi wahi hai).
+    if (await repo.isParticipant(call.id, userId)) return true;
     if (call.initiator_user_id === userId) return true;
+    // 1:1 legacy path: doosra conversation member.
     const other = await repo.getOtherMemberId(call.conversation_id, call.initiator_user_id);
     return other === userId;
+  }
+
+  // Active participants ka wire format (app grid render ke liye).
+  async function activeParticipantList(callId) {
+    const rows = await repo.listActiveParticipants(callId);
+    return rows.map((r) => ({
+      userId: r.user_id,
+      displayName: r.display_name || r.username || 'User',
+      username: r.username,
+      joinedAt: r.joined_at,
+    }));
+  }
+
+  // Group signaling relay: offer/answer/ICE — sender participant hona chahiye,
+  // target bhi active participant hona chahiye, call active honi chahiye.
+  async function relayGroupSignal(me, callId, targetUserId, event, payload) {
+    ensureDb();
+    const call = await requireCall(callId);
+    if (call.status !== 'ongoing') {
+      throw new AppError(409, 'GROUP_CALL_NOT_ACTIVE', 'Group call is not active');
+    }
+    if (!(await repo.isParticipant(callId, me.id))) {
+      throw new AppError(403, 'NOT_CALL_PARTICIPANT', 'You are not a participant of this call');
+    }
+    if (!targetUserId || !(await repo.isParticipant(callId, targetUserId))) {
+      throw new AppError(404, 'PARTICIPANT_NOT_FOUND', 'Target participant not in call');
+    }
+    emitToUser(targetUserId, event, { callId, fromUserId: me.id, ...payload });
+    return { relayed: true };
   }
 
   async function requireParticipant(call, userId) {
     if (!(await isParticipant(call, userId))) {
       throw new AppError(403, 'NOT_CALL_PARTICIPANT', 'You are not a participant of this call');
+    }
+  }
+
+  // REST/socket `me` mein sirf id hoti hai — push/peer-joined ke liye asli
+  // naam DB se lo. Fail par original `me` (fallback 'Nexora'/'User' labels).
+  async function withProfile(me) {
+    if (!me || me.display_name || me.username) return me;
+    if (typeof repo.findUserProfile !== 'function') return me;
+    try {
+      const profile = await repo.findUserProfile(me.id);
+      return profile ? { ...me, display_name: profile.display_name, username: profile.username } : me;
+    } catch (_) {
+      return me;
     }
   }
 
@@ -161,6 +251,64 @@ function createCallsService({
         throw new AppError(429, 'CALL_RATE_LIMITED', 'Too many outgoing calls. Wait a minute and try again.');
       }
       const membership = await requireMembership(conversationId, me.id);
+      me = await withProfile(me);
+
+      // ===== Group call: mesh flow — status ongoing (caller andar), sab
+      // members ko ring, per-peer signaling join ke baad relay hoti hai. =====
+      if (membership.kind === 'group') {
+        // WhatsApp style: group mein call pehle se chal rahi ho to nayi call
+        // nahi banti — caller usi mein join hota hai (group do calls mein na bate).
+        const ongoingId =
+          typeof repo.findOngoingGroupCall === 'function'
+            ? await repo.findOngoingGroupCall(conversationId)
+            : null;
+        if (ongoingId) {
+          const joined = await this.joinGroupCall(me, ongoingId);
+          return { ...joined, joined: true };
+        }
+        const memberIds = await repo.listOtherActiveMemberIds(conversationId, me.id);
+        if (memberIds.length === 0) {
+          throw new AppError(400, 'NO_OTHER_MEMBER', 'No other member in this conversation');
+        }
+        if (await isUserInCall(me.id)) {
+          throw new AppError(409, 'USER_IN_CALL', 'User is already in a call');
+        }
+        const id = crypto.randomUUID();
+        const row = await repo.insertCall({
+          id,
+          conversationId,
+          initiatorUserId: me.id,
+          callType,
+          status: 'ongoing',
+          startedAt: new Date(),
+        });
+        await repo.addParticipant(id, me.id);
+        await redisCall((r) => r.set(`call:active:${me.id}`, id, 'EX', activeTtlSeconds));
+
+        const call = repo.toCall(row);
+        const groupName = membership.name || 'Group';
+        const callerName = me.display_name || me.username || 'Nexora';
+        for (const memberId of memberIds) {
+          emitToUser(memberId, 'call:group:incoming', { call, groupName, callerName, callType });
+          // Push HAR HAAL mein (background/killed app ring sirf push se).
+          // pushToUser andar claimOnce dedup karta hai.
+          Promise.resolve()
+            .then(async () => {
+              await pushToUser(memberId, {
+                type: 'group-call',
+                callId: id,
+                conversationId,
+                callType,
+                initiatorUserId: me.id,
+                callerName,
+                groupName,
+              });
+            })
+            .catch(() => {});
+        }
+        return { call, participants: await activeParticipantList(id) };
+      }
+
       if (membership.kind !== 'one_to_one') {
         throw new AppError(400, 'CALLS_ONLY_ONE_TO_ONE', 'Calls are only available in one-to-one conversations');
       }
@@ -221,11 +369,99 @@ function createCallsService({
     },
 
     // GET /calls/:id — reconnect/rejoin ke liye current state.
+    // Group calls mein participants list bhi (app grid restore).
     async getCall(me, callId) {
       ensureDb();
       const call = await requireCall(callId);
+      const membership = await repo.findMembership(call.conversation_id, me.id);
+      if (membership && !membership.left_at && membership.kind === 'group') {
+        if (!(await repo.isParticipant(callId, me.id))) {
+          throw new AppError(403, 'NOT_CALL_PARTICIPANT', 'You are not a participant of this call');
+        }
+        return { call: repo.toCall(call), participants: await activeParticipantList(callId) };
+      }
+      // 1:1 (ya non-member): requireParticipant — stranger ko bhi
+      // NOT_CALL_PARTICIPANT milta hai (existing contract).
       await requireParticipant(call, me.id);
       return { call: repo.toCall(call) };
+    },
+
+    // ===== Group calls (mesh) — join/relay/leave =====
+
+    // Socket call:group:join — member call mein aata hai. Idempotent rejoin.
+    // Joiner ko existing participants milte hain (wo har peer ko offer bhejta
+    // hai — glare-free deterministic rule), baakiyon ko peer-joined.
+    async joinGroupCall(me, callId) {
+      ensureDb();
+      me = await withProfile(me);
+      const call = await requireCall(callId);
+      const membership = await requireMembership(call.conversation_id, me.id);
+      if (membership.kind !== 'group') {
+        throw new AppError(400, 'NOT_A_GROUP_CALL', 'This call is not a group call');
+      }
+      if (call.status !== 'ongoing') {
+        throw new AppError(409, 'GROUP_CALL_NOT_ACTIVE', 'Group call is not active');
+      }
+      if (!(await repo.isParticipant(callId, me.id))) {
+        const existing = await repo.listActiveParticipants(callId);
+        if (existing.length >= maxGroupParticipants) {
+          throw new AppError(409, 'GROUP_CALL_FULL', 'Group call is full');
+        }
+        const activeCallId = await findActiveCallForUser(me.id);
+        if (activeCallId && activeCallId !== callId) {
+          throw new AppError(409, 'USER_IN_CALL', 'You are already in another call');
+        }
+        await repo.addParticipant(callId, me.id);
+        await redisCall((r) => r.set(`call:active:${me.id}`, callId, 'EX', activeTtlSeconds));
+        for (const p of existing) {
+          emitToUser(p.user_id, 'call:group:peer-joined', {
+            callId,
+            user: {
+              userId: me.id,
+              displayName: me.display_name || me.username || 'User',
+              username: me.username,
+            },
+          });
+        }
+      }
+      return { call: repo.toCall(call), participants: await activeParticipantList(callId) };
+    },
+
+    // Socket call:group:offer — joiner existing peer ko offer deta hai.
+    async relayGroupOffer(me, callId, targetUserId, offerSdp) {
+      return relayGroupSignal(me, callId, targetUserId, 'call:group:offer', { offerSdp });
+    },
+
+    // Socket call:group:answer — existing peer joiner ko answer deta hai.
+    async relayGroupAnswer(me, callId, targetUserId, answerSdp) {
+      return relayGroupSignal(me, callId, targetUserId, 'call:group:answer', { answerSdp });
+    },
+
+    // Socket call:group:ice-candidate — per-peer ICE relay.
+    async relayGroupIce(me, callId, targetUserId, candidate) {
+      return relayGroupSignal(me, callId, targetUserId, 'call:group:ice-candidate', { candidate });
+    },
+
+    // Socket call:group:leave — participant nikal jata hai; aakhri nikle to
+    // call end. "End for all" nahi hai — har apna leave khud karta hai.
+    async leaveGroupCall(me, callId) {
+      ensureDb();
+      const call = await requireCall(callId);
+      if (!(await repo.isParticipant(callId, me.id))) {
+        throw new AppError(403, 'NOT_CALL_PARTICIPANT', 'You are not a participant of this call');
+      }
+      await repo.removeParticipant(callId, me.id);
+      await clearBusyKey(me.id, callId);
+      const remaining = await repo.listActiveParticipants(callId);
+      for (const p of remaining) {
+        emitToUser(p.user_id, 'call:group:peer-left', { callId, userId: me.id });
+      }
+      let callEnded = false;
+      if (remaining.length === 0 && call.status === 'ongoing') {
+        const row = await repo.transitionStatus(callId, ['ongoing'], 'ended', { endedAt: new Date() });
+        callEnded = Boolean(row);
+      }
+      return { left: true, callEnded };
     },
 
     // Socket call:answer — callee accept karta hai.
@@ -270,6 +506,7 @@ function createCallsService({
     // Socket call:reject — callee decline karta hai.
     async rejectCall(me, callId) {
       ensureDb();
+      me = await withProfile(me);
       const call = await requireCall(callId);
       await requireParticipant(call, me.id);
       if (call.initiator_user_id === me.id) {
@@ -302,6 +539,7 @@ function createCallsService({
     // Socket call:cancel — initiator answer se pehle chhor deta hai.
     async cancelCall(me, callId) {
       ensureDb();
+      me = await withProfile(me);
       const call = await requireCall(callId);
       await requireParticipant(call, me.id);
       if (call.initiator_user_id !== me.id) {
@@ -337,6 +575,7 @@ function createCallsService({
     // POST /calls/:id/end ya socket call:end — koi bhi participant.
     async endCall(me, callId) {
       ensureDb();
+      me = await withProfile(me);
       const call = await requireCall(callId);
       await requireParticipant(call, me.id);
 
@@ -407,6 +646,9 @@ function createCallsService({
       }
       return { relayed: Boolean(otherId) };
     },
+
+    // Offline (grace khatam) par ongoing calls auto-end — socket layer se.
+    autoEndOngoingCalls,
 
     // GET /conversations/:id/calls — call history (newest first).
     async listCalls(me, conversationId, cursor, limit) {

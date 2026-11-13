@@ -124,9 +124,72 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
     }
   }
 
+  // Pending receipt watermarks ko DB mein flush karo (optional substring
+  // filter: `:<userId>` suffix ya `:<convId>:`). Read paths (conversations
+  // list / messages list) isse pehle call karte hain taake unread count aur
+  // tick status hamesha fresh receipts se compute ho — warna seen hone ke
+  // baad bhi 5-10s tak stale badge/tick reload par wapas aa jata tha (flush
+  // background timer par hota hai). Fail-open: Redis down par kuch nahi
+  // karte — read purane DB state par chalta rehta hai (ticks nahi rukte).
+  async function flushWatermarksSafe(filter = null) {
+    if (!redis) return { flushed: 0 };
+    try {
+      const dirty = await withClient(redis, (r) => r.smembers('dirty:receipts'));
+      if (!dirty || dirty.length === 0) return { flushed: 0 };
+      const keys = filter ? dirty.filter((k) => k.includes(filter)) : dirty;
+      if (keys.length === 0) return { flushed: 0 };
+      const delivered = [];
+      const read = [];
+      const flushedKeys = [];
+      for (const key of keys) {
+        // eslint-disable-next-line no-await-in-loop
+        const val = await withClient(redis, (r) => r.get(key));
+        if (!val) continue; // watermark expire ho gaya — skip
+        const ts = Number(val);
+        if (!Number.isFinite(ts)) continue;
+        const parts = key.split(':');
+        if (parts.length !== 3) continue;
+        const [prefix, conversationId, userId] = parts;
+        const entry = { conversationId, userId, createdAt: new Date(ts) };
+        if (prefix === 'read') read.push(entry);
+        else if (prefix === 'deliv') delivered.push(entry);
+        else continue;
+        flushedKeys.push(key);
+      }
+      let flushed = 0;
+      if (delivered.length > 0) {
+        flushed += await repo.applyReceiptWatermarks('delivered', delivered);
+      }
+      if (read.length > 0) {
+        flushed += await repo.applyReceiptWatermarks('read', read);
+        // Seen flush DB mein likh gaya — readers ki doosri devices ko batao
+        // (unread badge sync). Har reader ko uski affected conversations bhejo.
+        const byUser = new Map();
+        for (const entry of read) {
+          if (!byUser.has(entry.userId)) byUser.set(entry.userId, []);
+          byUser.get(entry.userId).push(entry.conversationId);
+        }
+        for (const [userId, conversationIds] of byUser) {
+          emitToUser(userId, 'receipts:updated', { conversationIds });
+        }
+      }
+      if (flushedKeys.length > 0) {
+        await withClient(redis, (r) => r.srem('dirty:receipts', ...flushedKeys));
+      }
+      return { flushed };
+    } catch {
+      // Redis unavailable — fail-open (flusher baad mein dobara koshish karega).
+      return { flushed: 0 };
+    }
+  }
+
   // GET /conversations — meri active conversations (preview + unread + peer).
   async function listMyConversations(me, limit) {
     ensureDb();
+    // Mere pending seen watermarks pehle DB mein likho — warna unread count
+    // stale ho sakta hai (chat mein seen karne ke baad bhi badge reload par
+    // wapas aata tha). Key format `prefix:convId:userId` — suffix match.
+    await flushWatermarksSafe(`:${me.id}`);
     const rows = await repo.listConversations(me.id, limit);
     if (rows.length === 0) return { conversations: [] };
 
@@ -237,6 +300,11 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
       ensureDb();
       const membership = await requireMembership(conversationId, me.id);
 
+      // Is conversation ke pending receipts pehle DB mein flush karo — warna
+      // status subquery (ticks) stale parh leti hai: peer ne seen kiya tha
+      // lekin flush pending tha to blue tick reload par gray ho jata tha.
+      await flushWatermarksSafe(`:${conversationId}:`);
+
       let decodedCursor = null;
       if (cursor) {
         decodedCursor = repo.decodeCursor(cursor);
@@ -245,7 +313,7 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
         }
       }
 
-      const rows = await repo.listMessages(conversationId, decodedCursor, limit, membership.history_cleared_at);
+      const rows = await repo.listMessages(conversationId, decodedCursor, limit, membership.history_cleared_at, me.id);
       const hasMore = rows.length > limit;
       const page = hasMore ? rows.slice(0, limit) : rows;
 
@@ -478,39 +546,10 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
 
     // Dirty watermarks ko batch mein Postgres likho (background flusher isko
     // har 5-10s call karta hai). Idempotent — repeat/multi-dyno flushes safe.
+    // Saara kaam flushWatermarksSafe mein hai — yeh sirf unfiltered wrapper.
     async flushReceiptWatermarks() {
       ensureDb();
-      const dirty = await withClient(redis, (r) => r.smembers('dirty:receipts'));
-      if (!dirty || dirty.length === 0) return { flushed: 0 };
-      const delivered = [];
-      const read = [];
-      const flushedKeys = [];
-      for (const key of dirty) {
-        // eslint-disable-next-line no-await-in-loop
-        const val = await withClient(redis, (r) => r.get(key));
-        if (!val) continue; // watermark expire ho gaya — skip
-        const ts = Number(val);
-        if (!Number.isFinite(ts)) continue;
-        const parts = key.split(':');
-        if (parts.length !== 3) continue;
-        const [prefix, conversationId, userId] = parts;
-        const entry = { conversationId, userId, createdAt: new Date(ts) };
-        if (prefix === 'read') read.push(entry);
-        else if (prefix === 'deliv') delivered.push(entry);
-        else continue;
-        flushedKeys.push(key);
-      }
-      let flushed = 0;
-      if (delivered.length > 0) {
-        flushed += await repo.applyReceiptWatermarks('delivered', delivered);
-      }
-      if (read.length > 0) {
-        flushed += await repo.applyReceiptWatermarks('read', read);
-      }
-      if (flushedKeys.length > 0) {
-        await withClient(redis, (r) => r.srem('dirty:receipts', ...flushedKeys));
-      }
-      return { flushed };
+      return flushWatermarksSafe();
     },
   };
 }

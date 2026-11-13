@@ -69,7 +69,7 @@ function initV1Sockets(io, app) {
     if (graceTimers.has(userId)) return;
     const graceMs = presenceGraceSeconds * 1000;
     if (graceMs <= 0) {
-      schedulePresenceBroadcast(userId);
+      scheduleOfflineCleanup(userId);
       return;
     }
     const timer = setTimeout(() => {
@@ -81,7 +81,7 @@ function initV1Sockets(io, app) {
       })
         .then((still) => {
           if (still === 0) return; // reconnect ho gaya — offline nahi
-          schedulePresenceBroadcast(userId);
+          scheduleOfflineCleanup(userId);
         })
         .catch(() => {});
     }, graceMs);
@@ -123,6 +123,18 @@ function initV1Sockets(io, app) {
 
   function applyPresence(userId, change) {
     if (change.before !== change.after) schedulePresenceBroadcast(userId);
+  }
+
+  // Full offline confirmed (grace khatam / grace disabled) — presence
+  // broadcast + ongoing calls auto-end. App call ke dauraan kill ho jaye to
+  // 'ongoing' row/busy key agle 2h tak naye calls ko 409 se block karti thi;
+  // auto-end isay turant heal karta hai (peer ko call:ended milta hai).
+  function scheduleOfflineCleanup(userId) {
+    schedulePresenceBroadcast(userId);
+    const calls = app.locals.callsService;
+    if (calls && typeof calls.autoEndOngoingCalls === 'function') {
+      calls.autoEndOngoingCalls(userId).catch(() => {});
+    }
   }
 
   function setupPresence(socket) {
@@ -314,6 +326,52 @@ function initV1Sockets(io, app) {
     const callsService = app.locals.callsService;
 
     register('call:answer', (p) => callsService.answerCall(me(), p.callId, p.answerSdp));
+
+    // ===== Group calls (mesh) — per-peer relay, joiner offerer rule =====
+
+    register('call:group:join', (p) => {
+      if (!UUID_RE.test(String(p.callId || ''))) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid callId');
+      }
+      return callsService.joinGroupCall(me(), p.callId);
+    });
+
+    register('call:group:offer', (p) => {
+      if (!UUID_RE.test(String(p.callId || '')) || !UUID_RE.test(String(p.targetUserId || ''))) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid callId or targetUserId');
+      }
+      if (typeof p.offerSdp !== 'string' || p.offerSdp.length === 0 || p.offerSdp.length > 100000) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid offerSdp');
+      }
+      return callsService.relayGroupOffer(me(), p.callId, p.targetUserId, p.offerSdp);
+    });
+
+    register('call:group:answer', (p) => {
+      if (!UUID_RE.test(String(p.callId || '')) || !UUID_RE.test(String(p.targetUserId || ''))) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid callId or targetUserId');
+      }
+      if (typeof p.answerSdp !== 'string' || p.answerSdp.length === 0 || p.answerSdp.length > 100000) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid answerSdp');
+      }
+      return callsService.relayGroupAnswer(me(), p.callId, p.targetUserId, p.answerSdp);
+    });
+
+    register('call:group:ice-candidate', (p) => {
+      if (!UUID_RE.test(String(p.callId || '')) || !UUID_RE.test(String(p.targetUserId || ''))) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid callId or targetUserId');
+      }
+      if (!p.candidate || typeof p.candidate !== 'object') {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid candidate');
+      }
+      return callsService.relayGroupIce(me(), p.callId, p.targetUserId, p.candidate);
+    });
+
+    register('call:group:leave', (p) => {
+      if (!UUID_RE.test(String(p.callId || ''))) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Invalid callId');
+      }
+      return callsService.leaveGroupCall(me(), p.callId);
+    });
 
     register('call:reject', (p) => callsService.rejectCall(me(), p.callId));
 

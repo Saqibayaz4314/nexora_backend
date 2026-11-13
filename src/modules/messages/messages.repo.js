@@ -51,6 +51,9 @@ function toMessage(row) {
     editedAt: row.edited_at,
     deletedAt: row.deleted_at,
     createdAt: row.created_at,
+    // Sirf tab include karo jab status compute hua ho — baaki callers ka
+    // response shape wahi rehta hai.
+    ...(row.status ? { status: row.status } : {}),
   };
 }
 
@@ -263,7 +266,10 @@ function createMessagesRepo({ db }) {
     },
 
     // Cursor pagination: newest-first keyset. limit+1 fetch karte hain taake nextCursor pata chale.
-    async listMessages(conversationId, cursor, limit, historyClearedAt = null) {
+    // viewerUserId diya ho to apne messages ka status (sent/delivered/seen)
+    // doosre active members ke receipts se attach hota hai — history reload ke
+    // baad ticks sahi rehte hain (WhatsApp parity).
+    async listMessages(conversationId, cursor, limit, historyClearedAt = null, viewerUserId = null) {
       const params = [conversationId, limit + 1];
       let where = 'm.conversation_id = $1 AND m.deleted_at IS NULL';
       if (historyClearedAt) {
@@ -281,7 +287,57 @@ function createMessagesRepo({ db }) {
          LIMIT $2`,
         params
       );
-      return res.rows;
+      const rows = res.rows;
+      if (viewerUserId) {
+        // Status query alag rakhi hai — correlated subquery pg-mem mein
+        // unreliable thi, grouped query real PG + pg-mem dono par chalti hai.
+        // Seen: baaki active members SAB ne seen kar liya. Delivered: sab ne
+        // deliver kar liya (par kisi ne seen nahi kiya). Warna sent.
+        const statusRes = await q(
+          `SELECT m.id,
+             CASE
+               WHEN COUNT(*) = COUNT(r.seen_at) THEN 'seen'
+               WHEN COUNT(*) = COUNT(r.delivered_at) THEN 'delivered'
+               ELSE 'sent'
+             END AS status
+           FROM messages m
+           JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
+           LEFT JOIN message_receipts r ON r.message_id = m.id AND r.user_id = cm.user_id
+           WHERE m.conversation_id = $1 AND m.sender_user_id = $2
+             AND cm.user_id <> $2 AND cm.left_at IS NULL AND m.deleted_at IS NULL
+           GROUP BY m.id`,
+          [conversationId, viewerUserId]
+        );
+        const statusById = new Map(statusRes.rows.map((r) => [r.id, r.status]));
+        // Fallback: jin apne messages ka status nahi mila (koi active doosra
+        // member nahi — peer ne chat delete ki) unke ticks DB receipts se
+        // compute karo, warna chat delete ke baad ticks hamesha 'sent' dikhte.
+        const missing = rows
+          .filter((row) => row.sender_user_id === viewerUserId && !statusById.has(row.id))
+          .map((row) => row.id);
+        if (missing.length > 0) {
+          const placeholders = missing.map((_, i) => `$${i + 2}`).join(', ');
+          const fbRes = await q(
+            `SELECT r.message_id,
+               CASE
+                 WHEN COUNT(*) = COUNT(r.seen_at) THEN 'seen'
+                 WHEN COUNT(*) = COUNT(r.delivered_at) THEN 'delivered'
+                 ELSE 'sent'
+               END AS status
+             FROM message_receipts r
+             WHERE r.message_id IN (${placeholders}) AND r.user_id <> $1
+             GROUP BY r.message_id`,
+            [viewerUserId, ...missing]
+          );
+          for (const fb of fbRes.rows) statusById.set(fb.message_id, fb.status);
+        }
+        for (const row of rows) {
+          if (row.sender_user_id === viewerUserId) {
+            row.status = statusById.get(row.id) || 'sent';
+          }
+        }
+      }
+      return rows;
     },
 
     async listReactionsForMessages(messageIds) {
