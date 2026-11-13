@@ -64,7 +64,8 @@ test('registration flow', async (t) => {
       assert.equal(mailer.sent.length, 1);
       assert.equal(mailer.sent[0].type, 'email_verify');
       assert.equal(mailer.sent[0].to, 'sara@example.com');
-      assert.ok(mailer.sent[0].token.length >= 40);
+      // 6-digit code (OTP) — user app mein enter karta hai.
+      assert.match(mailer.sent[0].token, /^\d{6}$/);
     });
   });
 

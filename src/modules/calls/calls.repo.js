@@ -142,6 +142,20 @@ function createCallsRepo({ db }) {
       return res.rows[0] || null;
     },
 
+    // Expire before busy lookup, using the same status guard as answer/reject.
+    // If an answer wins the race, its ongoing row must still count as busy.
+    async expireRingingCallsForUser(userId, cutoff) {
+      await q(
+        `UPDATE call_sessions SET status = 'missed', ended_at = now()
+         WHERE status = 'ringing' AND created_at <= $2
+           AND conversation_id IN (
+             SELECT conversation_id FROM conversation_members
+             WHERE user_id = $1 AND left_at IS NULL
+           )`,
+        [userId, cutoff]
+      );
+    },
+
     // Busy detection: user kisi active (ringing/ongoing) call ka member hai ya nahi.
     async findActiveCallForUser(userId, since) {
       const res = await q(

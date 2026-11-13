@@ -521,9 +521,25 @@ test('messages: validation', async (t) => {
         .post(`/api/v1/conversations/${convId}/messages`)
         .set(auth(alice.accessToken))
         .set(fwd())
-        .send(msgBody({ messageType: 'sticker' }));
+        .send(msgBody({ messageType: 'not_a_type' }));
       assert.equal(res.status, 400);
       assert.equal(res.body.error.code, 'VALIDATION_ERROR');
+    });
+  });
+
+  await t.test('sticker messageType → 201', async () => {
+    await withApp(t, async ({ app, pool, mailer }) => {
+      const alice = await registerAndVerify(app, mailer, { username: 'alice_st', email: 'alice_st@example.com' });
+      const bob = await registerAndVerify(app, mailer, { username: 'bob_st', email: 'bob_st@example.com' });
+      const convId = await createConversation(pool, [alice.user.id, bob.user.id]);
+
+      const res = await request(app)
+        .post(`/api/v1/conversations/${convId}/messages`)
+        .set(auth(alice.accessToken))
+        .set(fwd())
+        .send(msgBody({ messageType: 'sticker' }));
+      assert.equal(res.status, 201);
+      assert.equal(res.body.data.message.messageType, 'sticker');
     });
   });
 });

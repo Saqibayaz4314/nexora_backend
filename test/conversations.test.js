@@ -185,6 +185,50 @@ test('conversations: create is get-or-create (idempotent, 200)', async (t) => {
   });
 });
 
+test('conversations: chat delete ke baad re-create same conversation id use karta hai', async (t) => {
+  await withApp(t, async ({ app, mailer }) => {
+    const alice = await register(app, mailer, { username: 'alice_recreate', email: 'alice_recreate@example.com' });
+    const bob = await register(app, mailer, { username: 'bob_recreate', email: 'bob_recreate@example.com' });
+
+    const first = await request(app)
+      .post('/api/v1/conversations')
+      .set(auth(alice.accessToken))
+      .set(fwd())
+      .send({ peerUserId: bob.user.id });
+    const convId = first.body.data.conversation.id;
+
+    // Alice chat delete karti hai (left_at set hota hai).
+    const hidden = await request(app)
+      .delete(`/api/v1/conversations/${convId}/self`)
+      .set(auth(alice.accessToken))
+      .set(fwd());
+    assert.equal(hidden.status, 200);
+
+    const listed = await request(app)
+      .get('/api/v1/conversations')
+      .set(auth(alice.accessToken))
+      .set(fwd());
+    assert.deepEqual(listed.body.data.conversations, []);
+
+    // Dobara chat start — nayi conversation nahi, wahi id wapas milti hai.
+    const again = await request(app)
+      .post('/api/v1/conversations')
+      .set(auth(alice.accessToken))
+      .set(fwd())
+      .send({ peerUserId: bob.user.id });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.data.created, false);
+    assert.equal(again.body.data.conversation.id, convId);
+
+    // List mein wapas aa gayi.
+    const relisted = await request(app)
+      .get('/api/v1/conversations')
+      .set(auth(alice.accessToken))
+      .set(fwd());
+    assert.deepEqual(relisted.body.data.conversations.map((c) => c.id), [convId]);
+  });
+});
+
 test('conversations: list shows last message + unread count, receipt clears it', async (t) => {
   await withApp(t, async ({ app, mailer }) => {
     const alice = await register(app, mailer, { username: 'alice_c4', email: 'alice_c4@example.com' });

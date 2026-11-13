@@ -11,6 +11,9 @@ const logger = require('../shared/logger');
 const { AppError } = require('../shared/errors');
 const schemas = require('../modules/messages/messages.schemas');
 const conversationParamsSchema = schemas.sendMessageSchema.pick({ params: true });
+const { createPresenceTracker } = require('../modules/presence/presence.tracker');
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function validateMessagePayload(schema, payload) {
   const parsed = schema.safeParse({
@@ -36,6 +39,84 @@ function ackError(error) {
 
 function initV1Sockets(io, app) {
   const v1 = io.of('/v1');
+  const presence = createPresenceTracker();
+  app.locals.presenceTracker = presence;
+
+  // Per-user transitions serialize hoti hain, taake tez connect/disconnect par
+  // "offline" event "online" se pehle na pohnche. Har job current state bhejta hai.
+  const presenceChains = new Map();
+
+  function schedulePresenceBroadcast(userId) {
+    const previous = presenceChains.get(userId) || Promise.resolve();
+    const job = previous
+      .then(async () => {
+        const repo = app.locals.messagesRepo;
+        const online = presence.isOnline(userId);
+        const lastSeenAt = await repo.touchLastSeen(userId);
+        const peers = await repo.listPresencePeers(userId);
+        if (peers.length === 0) return;
+        v1.to(peers.map((p) => `user:${p.id}`)).emit('presence:update', {
+          userId,
+          online,
+          lastSeenAt,
+        });
+      })
+      .catch((err) => {
+        logger.warn({ err: { message: err.message } }, 'presence broadcast failed');
+      });
+    presenceChains.set(userId, job);
+    job.then(() => {
+      if (presenceChains.get(userId) === job) presenceChains.delete(userId);
+    });
+  }
+
+  function applyPresence(userId, change) {
+    if (change.before !== change.after) schedulePresenceBroadcast(userId);
+  }
+
+  function setupPresence(socket) {
+    const userId = socket.userId;
+
+    socket.on('disconnect', () => {
+      applyPresence(userId, presence.remove(userId, socket.id));
+    });
+
+    applyPresence(userId, presence.set(userId, socket.id, true));
+
+    // App background/foreground — socket connected rehta hai (calls ke liye)
+    // lekin user "online" nahi dikhta.
+    socket.on('presence:background', () => {
+      applyPresence(userId, presence.set(userId, socket.id, false));
+    });
+    socket.on('presence:foreground', () => {
+      applyPresence(userId, presence.set(userId, socket.id, true));
+    });
+
+    // Query: sirf direct-chat peers (block ke baghair) ki presence milti hai.
+    socket.on('presence:query', async (payload, ack) => {
+      if (typeof ack !== 'function') return;
+      try {
+        const requested = payload && payload.userIds;
+        if (requested !== undefined && (!Array.isArray(requested) || requested.length > 500
+          || !requested.every((id) => typeof id === 'string' && UUID_RE.test(id)))) {
+          ack({ data: null, error: { code: 'VALIDATION_ERROR', message: 'Invalid request' } });
+          return;
+        }
+        const wanted = requested ? new Set(requested) : null;
+        const peers = await app.locals.messagesRepo.listPresencePeers(userId);
+        const result = peers
+          .filter((p) => !wanted || wanted.has(p.id))
+          .map((p) => ({
+            userId: p.id,
+            online: presence.isOnline(p.id),
+            lastSeenAt: p.last_seen_at,
+          }));
+        ack({ data: { presence: result }, error: null });
+      } catch (err) {
+        ack(ackError(err));
+      }
+    });
+  }
 
   // Auth: v1 JWT (typ=access) + PG session/user check — Mongo involved nahi.
   v1.use(async (socket, next) => {
@@ -76,6 +157,10 @@ function initV1Sockets(io, app) {
   v1.on('connection', async (socket) => {
     const userId = socket.userId;
     socket.join(`user:${userId}`);
+
+    // Presence handlers synchronously register hote hain (room restore ke await se
+    // pehle), taake disconnect ya early query miss na ho.
+    setupPresence(socket);
 
     // Apni saari conversations ke rooms auto-join karo (reconnect par state restore).
     try {

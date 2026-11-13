@@ -31,6 +31,13 @@ const emailLimiter = makeLimiter({
   },
 });
 
+// 6-digit code endpoints (verify/reset) — per-IP limit brute force rokta hai.
+const codeLimiter = makeLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyBy: (req) => `code:${req.ip}`,
+});
+
 function makeAuthRoutes() {
   const router = express.Router();
   const ctrl = makeAuthController();
@@ -39,10 +46,10 @@ function makeAuthRoutes() {
   router.post('/login', loginLimiter, validate(schemas.loginSchema), asyncHandler(ctrl.login));
   router.post('/refresh', validate(schemas.refreshSchema), asyncHandler(ctrl.refresh));
   router.post('/logout', validate(schemas.logoutSchema), asyncHandler(ctrl.logout));
-  router.post('/email/verify', emailLimiter, validate(schemas.verifyEmailSchema), asyncHandler(ctrl.verifyEmail));
+  router.post('/email/verify', emailLimiter, codeLimiter, validate(schemas.verifyEmailSchema), asyncHandler(ctrl.verifyEmail));
   router.post('/email/resend', emailLimiter, validate(schemas.resendVerificationSchema), asyncHandler(ctrl.resendVerification));
   router.post('/password/forgot', emailLimiter, validate(schemas.forgotPasswordSchema), asyncHandler(ctrl.forgotPassword));
-  router.post('/password/reset', validate(schemas.resetPasswordSchema), asyncHandler(ctrl.resetPassword));
+  router.post('/password/reset', codeLimiter, validate(schemas.resetPasswordSchema), asyncHandler(ctrl.resetPassword));
   router.get('/me', requireAuth, asyncHandler(ctrl.getMe));
   router.delete('/account', requireAuth, asyncHandler(ctrl.deleteAccount));
 

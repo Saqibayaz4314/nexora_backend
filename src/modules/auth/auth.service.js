@@ -9,6 +9,7 @@ const { AppError } = require('../../shared/errors');
 
 const uuid = () => crypto.randomUUID();
 const generateOpaqueToken = () => crypto.randomBytes(48).toString('base64url');
+const generateSixDigitCode = () => crypto.randomInt(100000, 1000000).toString();
 const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
 
 function createAuthService({ db, repo, mailer }) {
@@ -75,15 +76,17 @@ function createAuthService({ db, repo, mailer }) {
   }
 
   async function issueEmailToken(userId, kind, ttlSeconds) {
-    const token = generateOpaqueToken();
+    // 6-digit code (OTP) — user app mein type karta hai, link nahi.
+    // Hashed store + TTL + rate limits brute force ko impractical banate hain.
+    const code = generateSixDigitCode();
     await repo.createEmailToken({
       id: uuid(),
       userId,
       kind,
-      tokenHash: hashToken(token),
+      tokenHash: hashToken(code),
       expiresAt: new Date(Date.now() + ttlSeconds * 1000),
     });
-    return token;
+    return code;
   }
 
   function ttlText(seconds) {
@@ -258,10 +261,18 @@ function createAuthService({ db, repo, mailer }) {
       if (user) {
         try {
           await repo.deleteEmailTokens(user.id, 'password_reset');
-          const token = await issueEmailToken(user.id, 'password_reset', config.passwordResetTokenTtlSeconds);
+          // 6-digit code — app mein enter karke password reset hota hai.
+          const code = generateSixDigitCode();
+          await repo.createEmailToken({
+            id: uuid(),
+            userId: user.id,
+            kind: 'password_reset',
+            tokenHash: hashToken(code),
+            expiresAt: new Date(Date.now() + config.passwordResetTokenTtlSeconds * 1000),
+          });
           await mailer.sendPasswordResetEmail({
             to: emailNorm,
-            token,
+            token: code,
             expiresInText: ttlText(config.passwordResetTokenTtlSeconds),
           });
         } catch (err) {

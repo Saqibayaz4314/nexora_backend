@@ -273,6 +273,39 @@ function createMessagesRepo({ db }) {
       return res.rows;
     },
 
+    // ===== Presence (online / last seen) =====
+
+    // Direct (one_to_one) chat peers jo presence dekh sakte hain — block kisi bhi
+    // taraf se ho to exclude.
+    async listPresencePeers(userId) {
+      const res = await q(
+        `SELECT DISTINCT u.id, u.last_seen_at
+         FROM conversation_members mine
+         JOIN conversations c ON c.id = mine.conversation_id
+         JOIN conversation_members other ON other.conversation_id = mine.conversation_id
+         JOIN users u ON u.id = other.user_id
+         LEFT JOIN blocked_users b1
+           ON b1.blocker_user_id = mine.user_id AND b1.blocked_user_id = other.user_id
+         LEFT JOIN blocked_users b2
+           ON b2.blocker_user_id = other.user_id AND b2.blocked_user_id = mine.user_id
+         WHERE mine.user_id = $1 AND mine.left_at IS NULL
+           AND c.kind = 'one_to_one'
+           AND other.user_id <> $1 AND other.left_at IS NULL
+           AND u.deleted_at IS NULL
+           AND b1.blocker_user_id IS NULL AND b2.blocker_user_id IS NULL`,
+        [userId]
+      );
+      return res.rows;
+    },
+
+    async touchLastSeen(userId) {
+      const res = await q(
+        `UPDATE users SET last_seen_at = now() WHERE id = $1 RETURNING last_seen_at`,
+        [userId]
+      );
+      return res.rows[0] ? res.rows[0].last_seen_at : null;
+    },
+
     // ===== Conversations list/create (Stage 8) =====
 
     // User ke active memberships — newest activity pehle.
@@ -370,20 +403,34 @@ function createMessagesRepo({ db }) {
       return res.rows[0] || null;
     },
 
-    // Existing active one_to_one between do users (get-or-create ke liye).
+    // Existing one_to_one between do users (get-or-create ke liye).
+    // Ek taraf ne chat delete ki ho (left_at set) to bhi yahi conversation
+    // wapas use hoti hai — naya conversation id banne se E2EE key toot jati.
     async findOneToOne(userA, userB) {
       const res = await q(
-        `SELECT c.id
-         FROM conversation_members a
-         JOIN conversation_members b ON b.conversation_id = a.conversation_id
-         JOIN conversations c ON c.id = a.conversation_id
-         WHERE a.user_id = $1 AND b.user_id = $2
-           AND a.left_at IS NULL AND b.left_at IS NULL
+        `SELECT c.id, mine.left_at AS my_left_at, mine.hidden_at AS my_hidden_at
+         FROM conversation_members mine
+         JOIN conversation_members other ON other.conversation_id = mine.conversation_id
+         JOIN conversations c ON c.id = mine.conversation_id
+         WHERE mine.user_id = $1 AND other.user_id = $2
+           AND other.left_at IS NULL
            AND c.kind = 'one_to_one'
+         ORDER BY c.created_at ASC
          LIMIT 1`,
         [userA, userB]
       );
       return res.rows[0] || null;
+    },
+
+    // Chat delete hone ke baad dobara message karo to membership wapas active
+    // (hidden/history-clear bhi reset — same chat, same E2EE key).
+    async restoreMembership(userId, conversationId) {
+      await q(
+        `UPDATE conversation_members
+         SET left_at = NULL, hidden_at = NULL, history_cleared_at = NULL
+         WHERE conversation_id = $1 AND user_id = $2`,
+        [conversationId, userId]
+      );
     },
 
     // Naya one_to_one conversation + dono members (race par duplicate possible —

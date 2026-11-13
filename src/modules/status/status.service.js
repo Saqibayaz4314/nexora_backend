@@ -66,7 +66,14 @@ function createStatusService({ db, repo, mediaRepo, config }) {
       ...status,
       viewsCount,
       views: views
-        ? views.map((v) => ({ userId: v.viewer_user_id, viewedAt: v.viewed_at }))
+        ? views.map((v) => ({
+            userId: v.viewer_user_id,
+            name:
+              (v.viewer_display_name && String(v.viewer_display_name).trim()) ||
+              v.viewer_username ||
+              v.viewer_user_id,
+            viewedAt: v.viewed_at,
+          }))
         : undefined,
       reactions: reactions.map((r) => ({
         userId: r.user_id,

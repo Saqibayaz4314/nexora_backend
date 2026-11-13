@@ -51,13 +51,34 @@ function createCallsService({
     return new Date(Date.now() - activeTtlSeconds * 1000);
   }
 
+  async function findActiveCallForUser(userId) {
+    // DB is authoritative: Redis busy keys can outlive terminal calls or a ring.
+    // Atomically expire stale rings before lookup, without a per-row retry loop.
+    // Merely filtering by age could let an in-flight answer revive an old ring.
+    await repo.expireRingingCallsForUser(
+      userId,
+      new Date(Date.now() - ringTimeoutSeconds * 1000)
+    );
+    return repo.findActiveCallForUser(userId, activeWindowStart());
+  }
+
   async function isUserInCall(userId) {
-    // Fast path: Redis busy key.
-    const busy = await redisCall((r) => r.exists(`call:active:${userId}`));
-    if (busy) return true;
-    // Source of truth: DB (ringing/ongoing, active window ke andar).
-    const activeCallId = await repo.findActiveCallForUser(userId, activeWindowStart());
-    return Boolean(activeCallId);
+    return Boolean(await findActiveCallForUser(userId));
+  }
+
+  async function clearBusyKey(userId, callId) {
+    // Compare-and-delete atomically: a newer call may already own this key.
+    await redisCall((r) => r.eval(
+      "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0",
+      1,
+      `call:active:${userId}`,
+      callId
+    ));
+  }
+
+  async function clearRingingState(call) {
+    await redisCall((r) => r.del(`call:ring:${call.id}`));
+    await clearBusyKey(call.initiator_user_id, call.id);
   }
 
   async function requireMembership(conversationId, userId) {
@@ -119,13 +140,11 @@ function createCallsService({
   }
 
   async function ringExpired(call) {
-    // Redis TTL fast path; DB created_at fallback.
-    const alive = await redisCall((r) => r.exists(`call:ring:${call.id}`));
-    if (alive !== null && alive !== undefined) {
-      return alive === 0;
-    }
+    // The DB deadline also bounds Redis state (which may be delayed or stale).
     const created = call.created_at instanceof Date ? call.created_at : new Date(call.created_at);
-    return Date.now() - created.getTime() > ringTimeoutSeconds * 1000;
+    if (Date.now() - created.getTime() >= ringTimeoutSeconds * 1000) return true;
+    const alive = await redisCall((r) => r.exists(`call:ring:${call.id}`));
+    return alive === 0;
   }
 
   return {
@@ -181,6 +200,8 @@ function createCallsService({
               conversationId,
               callType,
               initiatorUserId: me.id,
+              // Caller ka naam notification title mein (WhatsApp style).
+              callerName: me.display_name || me.username || 'Nexora',
             });
           }
         })
@@ -209,11 +230,12 @@ function createCallsService({
         throw new AppError(409, 'CALL_NOT_RINGING', 'Call is not ringing');
       }
       if (await ringExpired(call)) {
-        await repo.transitionStatus(callId, ['ringing'], 'missed', { endedAt: new Date() });
+        const row = await repo.transitionStatus(callId, ['ringing'], 'missed', { endedAt: new Date() });
+        if (row) await clearRingingState(call);
         throw new AppError(410, 'CALL_EXPIRED', 'Call has expired');
       }
       // Busy check: koi AUR active call ho to block — yeh call khud allowed hai.
-      const activeCallId = await repo.findActiveCallForUser(me.id, activeWindowStart());
+      const activeCallId = await findActiveCallForUser(me.id);
       if (activeCallId && activeCallId !== callId) {
         throw new AppError(409, 'USER_IN_CALL', 'You are already in another call');
       }
@@ -250,7 +272,7 @@ function createCallsService({
       if (!row) {
         throw new AppError(409, 'CALL_NOT_RINGING', 'Call is not ringing anymore');
       }
-      await redisCall((r) => r.del(`call:ring:${callId}`));
+      await clearRingingState(call);
       emitToUser(call.initiator_user_id, 'call:rejected', { callId });
       return { call: repo.toCall(row) };
     },
@@ -270,7 +292,7 @@ function createCallsService({
       if (!row) {
         throw new AppError(409, 'CALL_NOT_RINGING', 'Call is not ringing anymore');
       }
-      await redisCall((r) => r.del(`call:ring:${callId}`, `call:active:${me.id}`));
+      await clearRingingState(call);
       const otherId = await repo.getOtherMemberId(call.conversation_id, me.id);
       if (otherId) {
         emitToUser(otherId, 'call:cancelled', { callId });
@@ -299,10 +321,10 @@ function createCallsService({
       await redisCall((r) => r.del(`call:ring:${callId}`));
       const otherId = await repo.getOtherMemberId(call.conversation_id, me.id);
       if (otherId) {
-        await redisCall((r) => r.del(`call:active:${otherId}`));
+        await clearBusyKey(otherId, callId);
         emitToUser(otherId, 'call:ended', { callId });
       }
-      await redisCall((r) => r.del(`call:active:${me.id}`));
+      await clearBusyKey(me.id, callId);
 
       return { call: repo.toCall(row) };
     },

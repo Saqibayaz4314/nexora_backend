@@ -82,8 +82,10 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
     }
   }
 
-  // Offline members ko push — content encrypted hai isliye body generic rehti hai.
-  async function pushToOfflineMembers(conversationId, senderUserId, messageId, statusPostId = null) {
+  // Offline members ko push — content encrypted hai isliye body generic rehti
+  // hai, lekin sender ka naam title mein jata hai (WhatsApp style). Naam
+  // metadata hai, E2EE is se compromise nahi hota.
+  async function pushToOfflineMembers(conversationId, senderUserId, messageId, statusPostId = null, senderName = null) {
     if (!pushDispatcher || !devicesRepo) return;
     const memberIds = await repo.listActiveMemberIds(conversationId);
     for (const memberId of memberIds) {
@@ -95,12 +97,16 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
       if (tokens.length > 0) {
         // eslint-disable-next-line no-await-in-loop
         await pushDispatcher.sendToUserDevices(tokens, {
-          title: 'Nexora',
+          title: senderName || 'Nexora',
           body: 'New message',
+          // dataOnly: app ka background handler notification dikhata hai AUR
+          // delivered receipt bhejta hai — double tick app band ho par bhi.
+          dataOnly: true,
           data: {
             type: 'message',
             conversationId,
             messageId,
+            ...(senderName ? { senderName } : {}),
             ...(statusPostId ? { statusPostId } : {}),
           },
         });
@@ -194,6 +200,11 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
 
       const existing = await repo.findOneToOne(me.id, peerUserId);
       if (existing) {
+        // Maine chat delete ki thi to wapas active karo (same conversation id,
+        // is liye E2EE conversation key bhi wahi rehti hai).
+        if (existing.my_left_at || existing.my_hidden_at) {
+          await repo.restoreMembership(me.id, existing.id);
+        }
         const { conversations } = await listMyConversations(me, 100);
         const found = conversations.find((c) => c.id === existing.id) || null;
         if (found) {
@@ -316,13 +327,14 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
       }
 
       // Media attach rules: media type → mediaId required; mediaId → media type non-text.
-      // Text-only messages ko mediaId nahi chahiye (caption media ke saath ciphertext mein jata hai).
+      // Text aur sticker messages ko mediaId nahi chahiye (caption/emoji
+      // ciphertext mein hi jata hai).
       if (mediaId) {
-        if (messageType === 'text') {
+        if (messageType === 'text' || messageType === 'sticker') {
           throw new AppError(400, 'MEDIA_MESSAGE_TYPE_MISMATCH', 'Media attachments require a media message type');
         }
         await requireUsableMedia(mediaId, me.id);
-      } else if (messageType !== 'text') {
+      } else if (messageType !== 'text' && messageType !== 'sticker') {
         throw new AppError(400, 'MEDIA_ID_REQUIRED', 'Media messages require mediaId');
       }
 
@@ -347,7 +359,8 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
       const message = repo.toMessage(row);
       emitConversation(conversationId, 'message:received', { message });
       // Offline members ko FCM push (best-effort — errors send ko fail nahi karte).
-      pushToOfflineMembers(conversationId, me.id, id, statusPostId || null).catch(() => {});
+      // Sender ka display name title mein jata hai (WhatsApp style).
+      pushToOfflineMembers(conversationId, me.id, id, statusPostId || null, me.display_name || me.username).catch(() => {});
 
       return { message, created: true };
     },

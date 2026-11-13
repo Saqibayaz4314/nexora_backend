@@ -5,7 +5,13 @@
 
 const STATUS_COLUMNS = `
   sp.id, sp.author_user_id, sp.media_id, sp.caption_ciphertext, sp.caption_nonce,
-  sp.caption_auth_tag, sp.expires_at, sp.created_at, sp.deleted_at`;
+  sp.caption_auth_tag, sp.expires_at, sp.created_at, sp.deleted_at,
+  u.display_name AS author_display_name, u.username AS author_username`;
+
+// FROM clause — users join author name ke liye (UUID ki jagah naam dikhe).
+const STATUS_FROM = `
+  status_posts sp
+  LEFT JOIN users u ON u.id = sp.author_user_id`;
 
 const STATUS_RETURN_COLUMNS = `
   id, author_user_id, media_id, caption_ciphertext, caption_nonce,
@@ -34,9 +40,15 @@ function decodeCursor(cursor) {
 
 function toStatus(row) {
   if (!row) return null;
+  // Author display name — users join se (display_name warna username).
+  const authorName =
+    (row.author_display_name && String(row.author_display_name).trim()) ||
+    (row.author_username && String(row.author_username).trim()) ||
+    null;
   return {
     id: row.id,
     authorUserId: row.author_user_id,
+    authorName,
     mediaId: row.media_id,
     captionCiphertext: row.caption_ciphertext,
     captionNonce: row.caption_nonce,
@@ -89,7 +101,7 @@ function createStatusRepo({ db }) {
 
     async findStatusById(postId) {
       const res = await q(
-        `SELECT ${STATUS_COLUMNS} FROM status_posts sp WHERE sp.id = $1 LIMIT 1`,
+        `SELECT ${STATUS_COLUMNS} FROM ${STATUS_FROM} WHERE sp.id = $1 LIMIT 1`,
         [postId]
       );
       return res.rows[0] || null;
@@ -98,7 +110,8 @@ function createStatusRepo({ db }) {
     // Status media authz ke liye — media_id se post dhundo (deleted excluded).
     async findStatusByMediaId(mediaId) {
       const res = await q(
-        `SELECT ${STATUS_COLUMNS} FROM status_posts sp WHERE sp.media_id = $1 AND sp.deleted_at IS NULL LIMIT 1`,
+        `SELECT ${STATUS_COLUMNS} FROM ${STATUS_FROM}
+         WHERE sp.media_id = $1 AND sp.deleted_at IS NULL LIMIT 1`,
         [mediaId]
       );
       return res.rows[0] || null;
@@ -136,7 +149,7 @@ function createStatusRepo({ db }) {
       }
       params.push(limit + 1);
       const res = await q(
-        `SELECT ${STATUS_COLUMNS} FROM status_posts sp
+        `SELECT ${STATUS_COLUMNS} FROM ${STATUS_FROM}
          ${where}
          ORDER BY sp.created_at DESC, sp.id DESC
          LIMIT $${params.length}`,
@@ -155,10 +168,14 @@ function createStatusRepo({ db }) {
     },
 
     async listViews(postId) {
+      // Viewer naam ke saath — author "kisne dekha" list mein naam dikhata hai.
       const res = await q(
-        `SELECT viewer_user_id, viewed_at FROM status_views
-         WHERE post_id = $1
-         ORDER BY viewed_at DESC`,
+        `SELECT sv.viewer_user_id, sv.viewed_at,
+                u.display_name AS viewer_display_name, u.username AS viewer_username
+         FROM status_views sv
+         LEFT JOIN users u ON u.id = sv.viewer_user_id
+         WHERE sv.post_id = $1
+         ORDER BY sv.viewed_at DESC`,
         [postId]
       );
       return res.rows;

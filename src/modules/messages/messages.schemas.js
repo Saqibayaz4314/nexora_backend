@@ -3,7 +3,7 @@
 const { z } = require('zod');
 
 // Client ke liye allowed message types — 'system' sirf server generate karta hai.
-const MESSAGE_TYPES = ['text', 'image', 'video', 'audio', 'document'];
+const MESSAGE_TYPES = ['text', 'image', 'video', 'audio', 'document', 'sticker'];
 
 const sendMessageSchema = z.object({
   params: z.object({

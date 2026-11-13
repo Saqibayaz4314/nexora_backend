@@ -72,17 +72,26 @@ function createFcmDispatcher({ logger, env = process.env } = {}) {
     }
   }
 
-  async function sendToDevice(pushToken, { title, body, data }) {
+  async function sendToDevice(pushToken, { title, body, data, dataOnly = false }) {
     if (!pushToken) {
       return { sent: false, reason: 'no_token' };
     }
     if (fcmReady && admin && messaging) {
       try {
-        await messaging().send({
+        // dataOnly: notification block nahi — OS auto-display ki jagah app ka
+        // Dart background handler chalta hai (local notification + delivered
+        // receipt). WhatsApp-style ticks ke liye zaroori: app killed ho tab
+        // bhi delivered receipt ja sake. Priority high taake doze mein defer na ho.
+        const message = {
           token: pushToken,
-          notification: { title, body },
           data: data || {},
-        });
+        };
+        if (!dataOnly) {
+          message.notification = { title, body };
+        } else {
+          message.android = { priority: 'high' };
+        }
+        await messaging().send(message);
         return { sent: true };
       } catch (err) {
         if (log.warn) log.warn({ err: { message: err.message } }, 'FCM send failed');

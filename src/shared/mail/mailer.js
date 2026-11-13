@@ -60,7 +60,7 @@ class MailService {
       : '';
     await this._send({
       to,
-      subject: 'Verify your Nexora email',
+      subject: 'Your Nexora verification code',
       html: templates.verificationEmail({ token, expiresInText, link }),
       text: templates.verificationText({ token, expiresInText, link }),
     });
@@ -72,7 +72,7 @@ class MailService {
       : '';
     await this._send({
       to,
-      subject: 'Reset your Nexora password',
+      subject: 'Your Nexora password reset code',
       html: templates.passwordResetEmail({ token, expiresInText, link }),
       text: templates.passwordResetText({ token, expiresInText, link }),
     });
