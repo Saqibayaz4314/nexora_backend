@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Environment — real secrets kabhi commit nahi hote
+.env
+.env.*
+!.env.example
+
+# Firebase service account keys — real secrets, kabhi commit nahi hote
+*-firebase-adminsdk-*.json
+firebase-adminsdk*.json
+service-account*.json
+gcp-credentials*.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build/coverage
+dist/
+coverage/
+
+# Local uploads (dev media mock)
+public/uploads/
+src/public/uploads/
+.tmp-test-uploads/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
