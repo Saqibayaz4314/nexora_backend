@@ -208,6 +208,45 @@ function createCallsService({
     }
   }
 
+  // Call push ka notification block (title/body/channel) — payload.type ke
+  // hisaab se. Ring (call/group-call) heads-up channel use karta hai; outcome
+  // (missed/rejected) default channel — caller/rejecter ka naam title mein.
+  function describeCallPush(payload) {
+    const type = payload.type || 'call';
+    const callType = payload.callType === 'video' ? 'video' : 'voice';
+    switch (type) {
+      case 'group-call': {
+        const callerName = payload.callerName || 'Nexora';
+        const groupName = payload.groupName ? ` · ${payload.groupName}` : '';
+        return {
+          title: callerName,
+          body: `Group ${callType} call${groupName}`,
+          channelId: 'nexora_call_channel',
+        };
+      }
+      case 'call':
+        return {
+          title: payload.callerName || 'Nexora',
+          body: `Incoming ${callType} call`,
+          channelId: 'nexora_call_channel',
+        };
+      case 'call-missed':
+        return {
+          title: payload.callerName || 'Nexora',
+          body: `Missed ${callType} call`,
+          channelId: null,
+        };
+      case 'call-rejected':
+        return {
+          title: payload.rejecterName || 'Nexora',
+          body: 'Call declined',
+          channelId: null,
+        };
+      default:
+        return { title: 'Nexora', body: 'Incoming call', channelId: null };
+    }
+  }
+
   async function pushToUser(userId, payload) {
     if (!pushDispatcher || !devicesRepo) return;
     // Push dedup: same event per user sirf ek baar (retry/race par duplicate
@@ -219,17 +258,22 @@ function createCallsService({
       return;
     }
     const tokens = await devicesRepo.findPushTokensByUserId(userId);
-    if (tokens.length > 0) {
-      // dataOnly: FCM ka generic notification block nahi — sirf app ki local
-      // notification dikhti hai (caller ka naam + fullScreenIntent + ringtone
-      // loop, WhatsApp style). Priority high data-only par khud lagti hai.
-      await pushDispatcher.sendToUserDevices(tokens, {
-        title: 'Nexora',
-        body: 'Incoming call',
-        data: payload,
-        dataOnly: true,
-      });
-    }
+    if (tokens.length === 0) return;
+    const { title, body, channelId } = describeCallPush(payload);
+    // dataOnly:false → FCM `notification` block bhi bhejte hain taake OS khud
+    // tray/heads-up dikhaye. Data-only call ring OEM-killed app (HiOS/MIUI/
+    // ColorOS) par deliver hi nahi hoti thi — notification block reliable hai
+    // (message push wahi fix tha, calls ke liye bhi wahi).
+    await pushDispatcher.sendToUserDevices(tokens, {
+      title,
+      body,
+      data: payload,
+      dataOnly: false,
+      channelId,
+      // tag = callId → missed/rejected notification purani ring notification
+      // ko replace karti hai (WhatsApp style), tray mein do nahi rehte.
+      tag: payload.callId ? `nexora:${payload.callId}` : null,
+    });
   }
 
   async function ringExpired(call) {

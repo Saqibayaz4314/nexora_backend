@@ -80,7 +80,7 @@ function createFcmDispatcher({ logger, env = process.env } = {}) {
     if (log.warn) log.warn('FCM credentials configured nahi hain (FIREBASE_SERVICE_ACCOUNT / GOOGLE_APPLICATION_CREDENTIALS) — pushes log transport par hain, devices ko notification NAHI milegi');
   }
 
-  async function sendToDevice(pushToken, { title, body, data, dataOnly = false }) {
+  async function sendToDevice(pushToken, { title, body, data, dataOnly = false, channelId = null, tag = null }) {
     if (!pushToken) {
       return { sent: false, reason: 'no_token' };
     }
@@ -102,6 +102,14 @@ function createFcmDispatcher({ logger, env = process.env } = {}) {
           // background/killed ho to bhi) — data-only ke baraks iska app
           // process ke zinda hone par depend nahi hota.
           message.notification = { title, body };
+          if (channelId || tag) {
+            message.android.notification = {};
+            // channelId: high-importance channel → heads-up banner (call ring
+            // ke liye). Tag: same tag wali notifications ek dusre ko replace
+            // karti hain (ring → missed/rejected outcome, WhatsApp style).
+            if (channelId) message.android.notification.channelId = channelId;
+            if (tag) message.android.notification.tag = tag;
+          }
         }
         await messaging().send(message);
         // Success log: iske bina Heroku logs mein pata nahi chalta ke push
