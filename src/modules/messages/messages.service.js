@@ -115,9 +115,13 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
       await pushDispatcher.sendToUserDevices(tokens, {
         title: senderName || 'Nexora',
         body: 'New message',
-        // dataOnly: app ka background handler notification dikhata hai AUR
-        // delivered receipt bhejta hai — double tick app band ho par bhi.
-        dataOnly: true,
+        // dataOnly:false → FCM `notification` block bhi bhejte hain taake OS
+        // khud tray notification dikhaye (app background/killed ho to bhi —
+        // HiOS/MIUI jaise aggressive OEM par data-only drop ho jata tha).
+        // ciphertext `data` mein rehta hai (E2EE safe); notification block
+        // mein sirf sender naam + generic body. Delivered receipt background
+        // handler se ab bhi aata hai (data payload delivered hota hai).
+        dataOnly: false,
         data: {
           type: 'message',
           conversationId,

@@ -93,11 +93,15 @@ function createFcmDispatcher({ logger, env = process.env } = {}) {
         const message = {
           token: pushToken,
           data: data || {},
+          // High priority dono cases mein — doze/battery-saver (HiOS, MIUI,
+          // ColorOS etc.) mein bhi message turant deliver ho, defer na ho.
+          android: { priority: 'high' },
         };
         if (!dataOnly) {
+          // notification block → OS khud tray notification dikhata hai (app
+          // background/killed ho to bhi) — data-only ke baraks iska app
+          // process ke zinda hone par depend nahi hota.
           message.notification = { title, body };
-        } else {
-          message.android = { priority: 'high' };
         }
         await messaging().send(message);
         // Success log: iske bina Heroku logs mein pata nahi chalta ke push
