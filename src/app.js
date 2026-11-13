@@ -77,6 +77,7 @@ function createApp(options = {}) {
     pushDispatcher: fcmDispatcher,
     getIo: () => app.get('io'),
     redis: getRedis(),
+    logger,
   });
   const devicesService = createDevicesService({ db: pool, repo: devicesRepo });
   const objectStorage = createObjectStorage({ config, logger });

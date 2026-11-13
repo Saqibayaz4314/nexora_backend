@@ -100,6 +100,9 @@ function createFcmDispatcher({ logger, env = process.env } = {}) {
           message.android = { priority: 'high' };
         }
         await messaging().send(message);
+        // Success log: iske bina Heroku logs mein pata nahi chalta ke push
+        // bheja gaya ya skip hua (online member / no token). Diagnosis ke liye.
+        if (log.info) log.info({ dataOnly }, 'FCM push sent');
         return { sent: true };
       } catch (err) {
         if (log.warn) log.warn({ err: { message: err.message } }, 'FCM send failed');

@@ -14,7 +14,7 @@ const MESSAGE_RATE_LIMIT_PER_MINUTE = 60;
 // Receipts watermarks (deliv:<conv>:<uid> / read:<conv>:<uid>) ka TTL — 24h.
 const RECEIPT_WATERMARK_TTL_SECONDS = 24 * 60 * 60;
 
-function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pushDispatcher, statusRepo, mediaRepo, redis }) {
+function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pushDispatcher, statusRepo, mediaRepo, redis, logger }) {
   if (!repo) {
     throw new Error('messages service ko repo chahiye');
   }
@@ -96,31 +96,36 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
     for (const memberId of memberIds) {
       if (memberId === senderUserId) continue;
       // eslint-disable-next-line no-await-in-loop
-      if (await isUserOnline(memberId)) continue;
+      if (await isUserOnline(memberId)) {
+        if (logger) logger.info({ conversationId, memberId }, 'push skipped (member online)');
+        continue;
+      }
       // eslint-disable-next-line no-await-in-loop
       const tokens = await devicesRepo.findPushTokensByUserId(memberId);
-      if (tokens.length > 0) {
-        // Push dedup: message push per member sirf ek baar (retry/race par
-        // duplicate notification nahi). Redis fail-open: error par push jata hai.
-        // eslint-disable-next-line no-await-in-loop
-        const first = await claimOnce(redis, `push:sent:${memberId}:msg:${messageId}`, 60);
-        if (!first) continue;
-        // eslint-disable-next-line no-await-in-loop
-        await pushDispatcher.sendToUserDevices(tokens, {
-          title: senderName || 'Nexora',
-          body: 'New message',
-          // dataOnly: app ka background handler notification dikhata hai AUR
-          // delivered receipt bhejta hai — double tick app band ho par bhi.
-          dataOnly: true,
-          data: {
-            type: 'message',
-            conversationId,
-            messageId,
-            ...(senderName ? { senderName } : {}),
-            ...(statusPostId ? { statusPostId } : {}),
-          },
-        });
+      if (tokens.length === 0) {
+        if (logger) logger.info({ conversationId, memberId }, 'push skipped (no device token)');
+        continue;
       }
+      // Push dedup: message push per member sirf ek baar (retry/race par
+      // duplicate notification nahi). Redis fail-open: error par push jata hai.
+      // eslint-disable-next-line no-await-in-loop
+      const first = await claimOnce(redis, `push:sent:${memberId}:msg:${messageId}`, 60);
+      if (!first) continue;
+      // eslint-disable-next-line no-await-in-loop
+      await pushDispatcher.sendToUserDevices(tokens, {
+        title: senderName || 'Nexora',
+        body: 'New message',
+        // dataOnly: app ka background handler notification dikhata hai AUR
+        // delivered receipt bhejta hai — double tick app band ho par bhi.
+        dataOnly: true,
+        data: {
+          type: 'message',
+          conversationId,
+          messageId,
+          ...(senderName ? { senderName } : {}),
+          ...(statusPostId ? { statusPostId } : {}),
+        },
+      });
     }
   }
 
