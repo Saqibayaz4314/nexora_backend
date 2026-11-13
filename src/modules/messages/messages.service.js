@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const { AppError } = require('../../shared/errors');
+const { claimOnce, incrWithExpiry, advanceWatermark, withClient } = require('../../shared/redis');
 
 // Messages service — business logic.
 // - Sirf conversation members messages bhej/sakte/dekh sakte hain.
@@ -9,7 +10,11 @@ const { AppError } = require('../../shared/errors');
 // - Idempotency: (device, clientMessageId) duplicate par same message return.
 // - getIo: socket fan-out ke liye lazy accessor (REST path bhi events emit kar sakta hai).
 
-function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pushDispatcher, statusRepo, mediaRepo }) {
+const MESSAGE_RATE_LIMIT_PER_MINUTE = 60;
+// Receipts watermarks (deliv:<conv>:<uid> / read:<conv>:<uid>) ka TTL — 24h.
+const RECEIPT_WATERMARK_TTL_SECONDS = 24 * 60 * 60;
+
+function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pushDispatcher, statusRepo, mediaRepo, redis }) {
   if (!repo) {
     throw new Error('messages service ko repo chahiye');
   }
@@ -95,6 +100,11 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
       // eslint-disable-next-line no-await-in-loop
       const tokens = await devicesRepo.findPushTokensByUserId(memberId);
       if (tokens.length > 0) {
+        // Push dedup: message push per member sirf ek baar (retry/race par
+        // duplicate notification nahi). Redis fail-open: error par push jata hai.
+        // eslint-disable-next-line no-await-in-loop
+        const first = await claimOnce(redis, `push:sent:${memberId}:msg:${messageId}`, 60);
+        if (!first) continue;
         // eslint-disable-next-line no-await-in-loop
         await pushDispatcher.sendToUserDevices(tokens, {
           title: senderName || 'Nexora',
@@ -268,6 +278,12 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
     // POST /conversations/:id/messages — idempotent send.
     async sendMessage(me, conversationId, payload) {
       ensureDb();
+      // Rate limit: max 60 messages/min — spam DB tak na pohanche.
+      // Redis fail-open: error par allow hote hain, sirf limit exceed par 429.
+      const msgCount = await incrWithExpiry(redis, `rl:msg:${me.id}`, 60);
+      if (msgCount !== null && msgCount > MESSAGE_RATE_LIMIT_PER_MINUTE) {
+        throw new AppError(429, 'MESSAGE_RATE_LIMITED', 'You are sending messages too fast. Wait a minute and try again.');
+      }
       const { clientMessageId, messageType, ciphertext, nonce, authTag, replyToId, statusPostId, mediaId } = payload;
       const membership = await requireMembership(conversationId, me.id);
 
@@ -433,13 +449,68 @@ function createMessagesService({ db, repo, contactsRepo, getIo, devicesRepo, pus
         throw new AppError(400, 'CANNOT_RECEIPT_OWN_MESSAGE', 'You cannot send receipts for your own message');
       }
       await requireMembership(message.conversation_id, me.id);
-      await repo.upsertReceipt(messageId, me.id, status);
+
+      // Watermark approach: Redis mein sirf (conv, user) → lastMessageTimestamp
+      // rakhte hain (EX 24h), har tick ke liye alag DB UPDATE nahi. Event
+      // turant emit hota hai — ticks real-time update hote hain. Flush har
+      // 5-10s mein batch DB update karta hai (dirty:receipts set se).
+      // Fail-open: Redis na ho to purana direct upsert path.
+      const prefix = status === 'seen' ? 'read' : 'deliv';
+      const wmKey = `${prefix}:${message.conversation_id}:${me.id}`;
+      const ts = new Date(message.created_at).getTime();
+      const advanced = await advanceWatermark(redis, wmKey, ts, RECEIPT_WATERMARK_TTL_SECONDS);
+      if (advanced === null) {
+        // Redis down — direct DB write (ticks rukne nahi chahiye).
+        await repo.upsertReceipt(messageId, me.id, status);
+      } else if (advanced === 1) {
+        // dirty set mein add — flusher is watermark ko batch mein DB likhega.
+        await withClient(redis, (r) => r.sadd('dirty:receipts', wmKey));
+        await withClient(redis, (r) => r.expire('dirty:receipts', RECEIPT_WATERMARK_TTL_SECONDS));
+      }
+      // advanced === 0 → watermark pehle se aage hai (flush pending ya ho chuka).
       emitConversation(message.conversation_id, status === 'seen' ? 'message:seen' : 'message:delivered', {
         messageId,
         conversationId: message.conversation_id,
         userId: me.id,
       });
       return { receipt: status, messageId };
+    },
+
+    // Dirty watermarks ko batch mein Postgres likho (background flusher isko
+    // har 5-10s call karta hai). Idempotent — repeat/multi-dyno flushes safe.
+    async flushReceiptWatermarks() {
+      ensureDb();
+      const dirty = await withClient(redis, (r) => r.smembers('dirty:receipts'));
+      if (!dirty || dirty.length === 0) return { flushed: 0 };
+      const delivered = [];
+      const read = [];
+      const flushedKeys = [];
+      for (const key of dirty) {
+        // eslint-disable-next-line no-await-in-loop
+        const val = await withClient(redis, (r) => r.get(key));
+        if (!val) continue; // watermark expire ho gaya — skip
+        const ts = Number(val);
+        if (!Number.isFinite(ts)) continue;
+        const parts = key.split(':');
+        if (parts.length !== 3) continue;
+        const [prefix, conversationId, userId] = parts;
+        const entry = { conversationId, userId, createdAt: new Date(ts) };
+        if (prefix === 'read') read.push(entry);
+        else if (prefix === 'deliv') delivered.push(entry);
+        else continue;
+        flushedKeys.push(key);
+      }
+      let flushed = 0;
+      if (delivered.length > 0) {
+        flushed += await repo.applyReceiptWatermarks('delivered', delivered);
+      }
+      if (read.length > 0) {
+        flushed += await repo.applyReceiptWatermarks('read', read);
+      }
+      if (flushedKeys.length > 0) {
+        await withClient(redis, (r) => r.srem('dirty:receipts', ...flushedKeys));
+      }
+      return { flushed };
     },
   };
 }

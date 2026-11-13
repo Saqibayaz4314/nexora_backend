@@ -64,6 +64,9 @@ function createApp(options = {}) {
   const mediaRepo = createMediaRepo({ db: pool });
   const devicesRepo = createDevicesRepo({ db: pool });
   const fcmDispatcher = createFcmDispatcher({ logger });
+  // Shared Redis client (null agar REDIS_URL set nahi) — sockets ise
+  // app.locals.redis se use karte hain (tests fake inject kar sakte hain).
+  app.locals.redis = getRedis();
   const messagesService = createMessagesService({
     db: pool,
     repo: messagesRepo,
@@ -73,6 +76,7 @@ function createApp(options = {}) {
     mediaRepo,
     pushDispatcher: fcmDispatcher,
     getIo: () => app.get('io'),
+    redis: getRedis(),
   });
   const devicesService = createDevicesService({ db: pool, repo: devicesRepo });
   const objectStorage = createObjectStorage({ config, logger });

@@ -133,6 +133,13 @@ const config = {
   callRingTimeoutSeconds: parseInt(env.CALL_RING_TIMEOUT_SECONDS || '60', 10), // ringing kitni der tak
   callActiveTtlSeconds: parseInt(env.CALL_ACTIVE_TTL_SECONDS || String(2 * 60 * 60), 10), // active call max (busy detection)
   callMaxDurationSeconds: parseInt(env.CALL_MAX_DURATION_SECONDS || String(24 * 60 * 60), 10), // ongoing cleanup threshold
+  // Slow-network grace: disconnect ke baad itne seconds tak offline mark nahi
+  // hota (false offline flash se bachne ke liye). 0 = turant offline (purana behavior).
+  presenceGraceSeconds: parseInt(env.PRESENCE_GRACE_SECONDS || '15', 10),
+  // Receipts watermark dirty-set flush kitni baar chalta hai (ms).
+  receiptFlushIntervalMs: parseInt(env.RECEIPT_FLUSH_INTERVAL_MS || '5000', 10),
+  // Receipts watermark keys ka TTL (seconds).
+  receiptWatermarkTtlSeconds: parseInt(env.RECEIPT_WATERMARK_TTL_SECONDS || String(24 * 60 * 60), 10),
   statusTtlSeconds: parseInt(env.STATUS_TTL_SECONDS || String(24 * 60 * 60), 10), // status 24h expiry
   logLevel: env.LOG_LEVEL || (isProd ? 'info' : 'debug'),
   appName: env.APP_NAME || 'Nexora',

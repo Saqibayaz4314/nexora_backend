@@ -201,6 +201,22 @@ function createCallsRepo({ db }) {
       return res.rows.map((r) => r.id);
     },
 
+    // Stale ringing + caller ka naam — missed-call push ke liye.
+    async listStaleRingingDetails(cutoff, limit) {
+      const res = await q(
+        `SELECT cs.id, cs.conversation_id, cs.initiator_user_id, cs.call_type,
+                u.display_name AS initiator_display_name,
+                u.username AS initiator_username
+         FROM call_sessions cs
+         JOIN users u ON u.id = cs.initiator_user_id
+         WHERE cs.status = 'ringing' AND cs.created_at < $1
+         ORDER BY cs.created_at
+         LIMIT $2`,
+        [cutoff, limit]
+      );
+      return res.rows;
+    },
+
     async listStaleOngoing(cutoff, limit) {
       const res = await q(
         `SELECT id FROM call_sessions

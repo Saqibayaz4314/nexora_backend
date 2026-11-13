@@ -9,6 +9,7 @@ const jwt = require('jsonwebtoken');
 const config = require('../config');
 const logger = require('../shared/logger');
 const { AppError } = require('../shared/errors');
+const { getRedis } = require('../shared/redis');
 const schemas = require('../modules/messages/messages.schemas');
 const conversationParamsSchema = schemas.sendMessageSchema.pick({ params: true });
 const { createPresenceTracker } = require('../modules/presence/presence.tracker');
@@ -41,6 +42,56 @@ function initV1Sockets(io, app) {
   const v1 = io.of('/v1');
   const presence = createPresenceTracker();
   app.locals.presenceTracker = presence;
+
+  // Redis (ephemeral socket/presence state) — tests fake inject kar sakte hain.
+  const redisClient = app.locals.redis || getRedis();
+  const sockTtlSeconds = 3600; // sock:<userId> set TTL (heartbeat refresh hota hai)
+  const presenceGraceSeconds = config.presenceGraceSeconds > 0 ? config.presenceGraceSeconds : 0;
+
+  // Best-effort Redis call — fail-open (null return, no crash).
+  async function redisCall(fn) {
+    if (!redisClient) return null;
+    try {
+      return await fn(redisClient);
+    } catch (err) {
+      logger.warn({ err: { message: err.message } }, 'redis call failed (fail-open)');
+      return null;
+    }
+  }
+
+  // Disconnect grace timers: userId -> Timeout. Grace khatam hone par hi
+  // presence offline Postgres mein jata hai (false offline flash nahi).
+  const graceTimers = new Map();
+
+  // Grace khatam — Redis grace key ab bhi ho (ya Redis down ho) to offline
+  // mark karo. Key 0 ho to kisi dyno par reconnect ho chuka hai — skip.
+  function scheduleOfflineAfterGrace(userId) {
+    if (graceTimers.has(userId)) return;
+    const graceMs = presenceGraceSeconds * 1000;
+    if (graceMs <= 0) {
+      schedulePresenceBroadcast(userId);
+      return;
+    }
+    const timer = setTimeout(() => {
+      graceTimers.delete(userId);
+      redisCall(async (r) => {
+        const still = await r.exists(`grace:${userId}`);
+        await r.del(`grace:${userId}`);
+        return still;
+      })
+        .then((still) => {
+          if (still === 0) return; // reconnect ho gaya — offline nahi
+          schedulePresenceBroadcast(userId);
+        })
+        .catch(() => {});
+    }, graceMs);
+    timer.unref();
+    graceTimers.set(userId, timer);
+    // Grace key cross-dyno "cancel" signal hai — TTL grace se thora lamba
+    // taake timer race mein key expire na ho jaye. Timing LOCAL timer se
+    // hoti hai, key sirf reconnect detect karne ke liye hai.
+    redisCall((r) => r.set(`grace:${userId}`, '1', 'EX', presenceGraceSeconds + 15)).catch(() => {});
+  }
 
   // Per-user transitions serialize hoti hain, taake tez connect/disconnect par
   // "offline" event "online" se pehle na pohnche. Har job current state bhejta hai.
@@ -77,8 +128,48 @@ function initV1Sockets(io, app) {
   function setupPresence(socket) {
     const userId = socket.userId;
 
-    socket.on('disconnect', () => {
-      applyPresence(userId, presence.remove(userId, socket.id));
+    // Connect: active socket set mein add (EX 3600) + grace cancel/delete —
+    // slow-network reconnect par false offline flash nahi hota.
+    redisCall(async (r) => {
+      await r.sadd(`sock:${userId}`, socket.id);
+      await r.expire(`sock:${userId}`, sockTtlSeconds);
+      await r.del(`grace:${userId}`);
+    }).catch(() => {});
+    const pendingGrace = graceTimers.get(userId);
+    if (pendingGrace) {
+      clearTimeout(pendingGrace);
+      graceTimers.delete(userId);
+    }
+
+    // Heartbeat (engine.io ping/pong) par set TTL refresh — stale sockets
+    // kabhi Redis mein leak na hon. Client disconnect ho jaye to set TTL se
+    // khud expire ho jata hai.
+    if (socket.conn && typeof socket.conn.on === 'function') {
+      socket.conn.on('heartbeat', () => {
+        redisCall((r) => r.expire(`sock:${userId}`, sockTtlSeconds)).catch(() => {});
+      });
+    }
+
+    socket.on('disconnect', async () => {
+      const change = presence.remove(userId, socket.id);
+      // Redis set bookkeeping (fail-open) + cross-dyno socket count check.
+      let otherDynoSockets = 0;
+      let redisOk = true;
+      try {
+        if (redisClient) {
+          await redisClient.srem(`sock:${userId}`, socket.id);
+          otherDynoSockets = await redisClient.scard(`sock:${userId}`);
+        }
+      } catch (err) {
+        redisOk = false;
+        logger.warn({ err: { message: err.message } }, 'sock set cleanup failed (fail-open)');
+      }
+      // Sirf online→offline transition par grace (background hone par offline
+      // pehle hi broadcast ho chuka hota hai — dobara nahi).
+      if (change.before && !change.after) {
+        if (redisOk && otherDynoSockets > 0) return; // doosre dyno par zinda hai
+        scheduleOfflineAfterGrace(userId);
+      }
     });
 
     applyPresence(userId, presence.set(userId, socket.id, true));
@@ -232,7 +323,9 @@ function initV1Sockets(io, app) {
 
     register('call:ice-candidate', (p) => callsService.relayIceCandidate(me(), p.callId, p.candidate));
 
-    // Explicit room join (membership verify hoti hai server-side).
+    // Explicit room join (membership verify hoti hai server-side). Join par
+    // current typers bhi milte hain (Redis EX 5 state) — app late join par
+    // "X is typing" dikha sakti hai. Redis fail-open: [] return hota hai.
     register('conversation:join', async (p) => {
       const membership = await app.locals.messagesRepo.findMembership(p.conversationId, socket.userId);
       if (!membership || membership.left_at) {
@@ -241,15 +334,32 @@ function initV1Sockets(io, app) {
         throw err;
       }
       socket.join(`conversation:${p.conversationId}`);
-      return { joined: true, conversationId: p.conversationId };
+      let typingUserIds = [];
+      const scanRes = await redisCall((r) =>
+        r.scan('0', 'MATCH', `typing:${p.conversationId}:*`, 'COUNT', 50)
+      );
+      if (scanRes && Array.isArray(scanRes[1])) {
+        typingUserIds = scanRes[1]
+          .map((k) => k.slice(k.lastIndexOf(':') + 1))
+          .filter((id) => id !== socket.userId && UUID_RE.test(id));
+      }
+      return { joined: true, conversationId: p.conversationId, typingUserIds };
     });
 
     // Typing indicators — conversation room mein broadcast (sender ko exclude).
+    // Typing state Redis mein ephemeral rehta hai (EX 5) — DB mein kuch nahi
+    // likha jata. Key TTL hi authoritative hai (sliding window).
     async function broadcastTyping(p, event) {
       const { params: { conversationId } } = validateMessagePayload(conversationParamsSchema, p);
       const membership = await app.locals.messagesRepo.findMembership(conversationId, userId);
       if (!membership || membership.left_at) {
         throw new AppError(403, 'NOT_CONVERSATION_MEMBER', 'Not a member of this conversation');
+      }
+      const key = `typing:${conversationId}:${userId}`;
+      if (event === 'typing:started') {
+        await redisCall((r) => r.set(key, '1', 'EX', 5));
+      } else {
+        await redisCall((r) => r.del(key));
       }
       socket.to(`conversation:${conversationId}`).emit(event, { conversationId, userId });
       return { conversationId };

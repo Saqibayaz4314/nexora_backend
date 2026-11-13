@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const { AppError } = require('../../shared/errors');
+const { claimOnce, incrWithExpiry } = require('../../shared/redis');
 
 // Calls service — WebRTC call lifecycle (Stage 5).
 // - Signaling call IDs par hoti hai; media peer-to-peer hai (server relay nahi karta).
@@ -30,6 +31,7 @@ function createCallsService({
 
   const ringTimeoutSeconds = (config && config.callRingTimeoutSeconds) || 60;
   const activeTtlSeconds = (config && config.callActiveTtlSeconds) || 2 * 60 * 60;
+  const callRateLimitPerMinute = (config && config.callRateLimitPerMinute) || 5;
 
   function ensureDb() {
     if (!db) {
@@ -116,25 +118,26 @@ function createCallsService({
     }
   }
 
-  async function isUserOnline(userId) {
-    const io = getIo ? getIo() : null;
-    if (!io) return false;
-    try {
-      const sockets = await io.in(`user:${userId}`).fetchSockets();
-      return sockets.length > 0;
-    } catch {
-      return false;
-    }
-  }
-
   async function pushToUser(userId, payload) {
     if (!pushDispatcher || !devicesRepo) return;
+    // Push dedup: same event per user sirf ek baar (retry/race par duplicate
+    // notification nahi). type+callId event identity hai — ring push aur
+    // missed/rejected outcome push alag events hain, dono bhej sakte hain.
+    // Redis fail-open: claim error par push phir bhi jata hai.
+    const eventId = payload && payload.callId ? `${payload.type || 'call'}:${payload.callId}` : null;
+    if (eventId && !(await claimOnce(redis, `push:sent:${userId}:${eventId}`, 60))) {
+      return;
+    }
     const tokens = await devicesRepo.findPushTokensByUserId(userId);
     if (tokens.length > 0) {
+      // dataOnly: FCM ka generic notification block nahi — sirf app ki local
+      // notification dikhti hai (caller ka naam + fullScreenIntent + ringtone
+      // loop, WhatsApp style). Priority high data-only par khud lagti hai.
       await pushDispatcher.sendToUserDevices(tokens, {
         title: 'Nexora',
         body: 'Incoming call',
         data: payload,
+        dataOnly: true,
       });
     }
   }
@@ -151,6 +154,12 @@ function createCallsService({
     // POST /conversations/:id/calls — initiate (ringing) + callee notify.
     async initiateCall(me, conversationId, { callType, offerSdp }) {
       ensureDb();
+      // Rate limit: max 5 outgoing calls/min — spam DB tak na pohanche.
+      // Redis fail-open: error par allow hote hain, sirf limit exceed par 429.
+      const callCount = await incrWithExpiry(redis, `rl:call:${me.id}`, 60);
+      if (callCount !== null && callCount > callRateLimitPerMinute) {
+        throw new AppError(429, 'CALL_RATE_LIMITED', 'Too many outgoing calls. Wait a minute and try again.');
+      }
       const membership = await requireMembership(conversationId, me.id);
       if (membership.kind !== 'one_to_one') {
         throw new AppError(400, 'CALLS_ONLY_ONE_TO_ONE', 'Calls are only available in one-to-one conversations');
@@ -190,20 +199,21 @@ function createCallsService({
       const call = repo.toCall(row);
       emitToUser(otherId, 'call:incoming', { call });
 
-      // Offline callee ko push (best-effort).
+      // Push HAR HAAL mein bhejo (online ho ya nahi): app background/killed
+      // ho to sirf push se ring notification milti hai. Socket event sirf
+      // foreground app ke liye live in-app screen kholta hai. App side inCall
+      // guard hai — double UI nahi banta. Best-effort fire-and-forget.
       Promise.resolve()
         .then(async () => {
-          if (!(await isUserOnline(otherId))) {
-            await pushToUser(otherId, {
-              type: 'call',
-              callId: id,
-              conversationId,
-              callType,
-              initiatorUserId: me.id,
-              // Caller ka naam notification title mein (WhatsApp style).
-              callerName: me.display_name || me.username || 'Nexora',
-            });
-          }
+          await pushToUser(otherId, {
+            type: 'call',
+            callId: id,
+            conversationId,
+            callType,
+            initiatorUserId: me.id,
+            // Caller ka naam notification title mein (WhatsApp style).
+            callerName: me.display_name || me.username || 'Nexora',
+          });
         })
         .catch(() => {});
 
@@ -274,6 +284,18 @@ function createCallsService({
       }
       await clearRingingState(call);
       emitToUser(call.initiator_user_id, 'call:rejected', { callId });
+      // Caller ko notification: callee ne decline kar diya (caller ka app
+      // background/killed ho to bhi pata chale — error notification gap).
+      Promise.resolve()
+        .then(async () => {
+          await pushToUser(call.initiator_user_id, {
+            type: 'call-rejected',
+            callId,
+            callType: call.call_type,
+            rejecterName: me.display_name || me.username || 'Nexora',
+          });
+        })
+        .catch(() => {});
       return { call: repo.toCall(row) };
     },
 
@@ -296,6 +318,18 @@ function createCallsService({
       const otherId = await repo.getOtherMemberId(call.conversation_id, me.id);
       if (otherId) {
         emitToUser(otherId, 'call:cancelled', { callId });
+        // Callee ko "Missed call" push — ring notification hat jati hai aur
+        // missed call ka record milta hai (WhatsApp style).
+        Promise.resolve()
+          .then(async () => {
+            await pushToUser(otherId, {
+              type: 'call-missed',
+              callId,
+              callType: call.call_type,
+              callerName: me.display_name || me.username || 'Nexora',
+            });
+          })
+          .catch(() => {});
       }
       return { call: repo.toCall(row) };
     },
@@ -307,9 +341,10 @@ function createCallsService({
       await requireParticipant(call, me.id);
 
       let row = null;
+      let toStatus = null;
       if (call.status === 'ringing') {
         // Initiator end → cancelled; callee end → rejected (decline).
-        const toStatus = call.initiator_user_id === me.id ? 'cancelled' : 'rejected';
+        toStatus = call.initiator_user_id === me.id ? 'cancelled' : 'rejected';
         row = await repo.transitionStatus(callId, ['ringing'], toStatus, { endedAt: new Date() });
       } else if (call.status === 'ongoing') {
         row = await repo.transitionStatus(callId, ['ongoing'], 'ended', { endedAt: new Date() });
@@ -323,6 +358,35 @@ function createCallsService({
       if (otherId) {
         await clearBusyKey(otherId, callId);
         emitToUser(otherId, 'call:ended', { callId });
+        // Ringing end ke dono outcomes doosri side ko push hone chahiye:
+        // initiator end → cancelled → callee missed; callee end → rejected →
+        // caller declined. Socket event UI ke liye, push notification ke liye.
+        const outcome =
+          call.status === 'ringing' && toStatus === 'cancelled'
+            ? {
+                type: 'call-missed',
+                callerName: me.display_name || me.username || 'Nexora',
+              }
+            : call.status === 'ringing' && toStatus === 'rejected'
+              ? {
+                  type: 'call-rejected',
+                  rejecterName: me.display_name || me.username || 'Nexora',
+                }
+              : null;
+        if (outcome) {
+          Promise.resolve()
+            .then(async () => {
+              await pushToUser(otherId, {
+                type: outcome.type,
+                callId,
+                callType: call.call_type,
+                ...(outcome.callerName
+                  ? { callerName: outcome.callerName }
+                  : { rejecterName: outcome.rejecterName }),
+              });
+            })
+            .catch(() => {});
+        }
       }
       await clearBusyKey(me.id, callId);
 
@@ -383,6 +447,48 @@ function createCallsService({
         iceServers,
         turnConfigured: Boolean(turn.urls && turn.urls.length > 0 && turn.username && turn.credential),
       };
+    },
+
+    // Ring expire (koi answer nahi) — callee ko missed-call push ke saath.
+    // Server in-process interval se chalta hai; scripts/cleanup-calls.js bhi
+    // independent hai — dono idempotent hain (status guard atomic hai).
+    async cleanupStaleRings() {
+      if (!repo || !db) return { expired: 0 };
+      try {
+        const cutoff = new Date(Date.now() - ringTimeoutSeconds * 1000);
+        const rows = await repo.listStaleRingingDetails(cutoff, 100);
+        let expired = 0;
+        for (const row of rows) {
+          // Atomic ['ringing'] guard — race mein answer ho chuka ho to skip.
+          // eslint-disable-next-line no-await-in-loop
+          const updated = await repo.transitionStatus(
+            row.id,
+            ['ringing'],
+            'missed',
+            { endedAt: new Date() }
+          );
+          if (!updated) continue;
+          expired++;
+          await clearRingingState(updated);
+          const otherId = await repo.getOtherMemberId(
+            row.conversation_id,
+            row.initiator_user_id
+          );
+          if (otherId) {
+            // Callee ko "Missed call" — ring notification bhi isi se hat'ti hai.
+            await pushToUser(otherId, {
+              type: 'call-missed',
+              callId: row.id,
+              callType: row.call_type,
+              callerName:
+                row.initiator_display_name || row.initiator_username || 'Nexora',
+            }).catch(() => {});
+          }
+        }
+        return { expired };
+      } catch {
+        return { expired: 0 };
+      }
     },
   };
 }

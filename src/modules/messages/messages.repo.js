@@ -207,6 +207,61 @@ function createMessagesRepo({ db }) {
       }
     },
 
+    // Receipts watermark batch flush — har tick ke liye alag UPDATE nahi.
+    // entries: [{ conversationId, userId, createdAt }] — watermark "is
+    // conversation mein is user ne is time tak sab messages dekh/deliver kiye".
+    // Ek hi query mein saare watermarks (VALUES list); ON CONFLICT guards
+    // idempotent (repeat flushes / multi-dyno safe). NOT EXISTS se
+    // already-marked rows touch nahi hote.
+    async applyReceiptWatermarks(kind, entries) {
+      if (!entries || entries.length === 0) return 0;
+      const params = [];
+      const rows = entries.map((e, i) => {
+        const base = i * 3;
+        params.push(e.conversationId, e.userId, e.createdAt);
+        return `($${base + 1}::uuid, $${base + 2}::uuid, $${base + 3}::timestamptz)`;
+      });
+      const values = rows.join(', ');
+      if (kind === 'read') {
+        const res = await q(
+          `INSERT INTO message_receipts (message_id, user_id, delivered_at, seen_at)
+           SELECT m.id, e.uid, now(), now()
+           FROM messages m
+           JOIN (VALUES ${values}) AS e(conv, uid, ts)
+             ON m.conversation_id = e.conv
+             AND m.sender_user_id != e.uid
+             AND m.created_at <= e.ts
+             AND m.deleted_at IS NULL
+           LEFT JOIN message_receipts r
+             ON r.message_id = m.id AND r.user_id = e.uid AND r.seen_at IS NOT NULL
+           WHERE r.message_id IS NULL
+           ON CONFLICT (message_id, user_id) DO UPDATE SET
+             delivered_at = COALESCE(message_receipts.delivered_at, now()),
+             seen_at = now()
+           WHERE message_receipts.seen_at IS NULL`,
+          params
+        );
+        return res.rowCount;
+      }
+      const res = await q(
+        `INSERT INTO message_receipts (message_id, user_id, delivered_at)
+         SELECT m.id, e.uid, now()
+         FROM messages m
+         JOIN (VALUES ${values}) AS e(conv, uid, ts)
+           ON m.conversation_id = e.conv
+           AND m.sender_user_id != e.uid
+           AND m.created_at <= e.ts
+           AND m.deleted_at IS NULL
+         LEFT JOIN message_receipts r
+           ON r.message_id = m.id AND r.user_id = e.uid AND r.delivered_at IS NOT NULL
+         WHERE r.message_id IS NULL
+         ON CONFLICT (message_id, user_id) DO UPDATE SET delivered_at = now()
+         WHERE message_receipts.delivered_at IS NULL`,
+        params
+      );
+      return res.rowCount;
+    },
+
     // Cursor pagination: newest-first keyset. limit+1 fetch karte hain taake nextCursor pata chale.
     async listMessages(conversationId, cursor, limit, historyClearedAt = null) {
       const params = [conversationId, limit + 1];
